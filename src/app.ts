@@ -2,6 +2,7 @@ import express from 'express';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import ingestRouter from './routes/ingest';
+import adminRouter from './routes/admin';
 
 dotenv.config();
 
@@ -16,6 +17,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.use('/api/v5', ingestRouter);
+app.use('/dashboard/admin', adminRouter);
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);

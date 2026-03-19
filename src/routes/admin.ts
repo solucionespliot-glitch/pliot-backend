@@ -1,0 +1,34 @@
+import { Router, Request, Response } from 'express';
+import { z } from 'zod';
+import { requireAuth, requireOrg, requireRole } from '../middleware/auth';
+
+const router = Router();
+
+const ImpersonateSchema = z.object({
+  organization_id: z.string().uuid(),
+});
+
+// POST /dashboard/admin/impersonate — superuser only
+// Instructs the frontend which organization_id to pass in X-Impersonate-Org
+router.post(
+  '/impersonate',
+  requireAuth,
+  requireOrg,
+  requireRole(['superuser']),
+  (req: Request, res: Response) => {
+    const parsed = ImpersonateSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0].message });
+      return;
+    }
+
+    res.json({
+      ok:              true,
+      organization_id: parsed.data.organization_id,
+      note:            'Pass this organization_id in the X-Impersonate-Org header on subsequent requests to act on behalf of that organization.',
+    });
+  },
+);
+
+export default router;
