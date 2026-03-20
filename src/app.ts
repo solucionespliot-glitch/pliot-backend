@@ -7,6 +7,8 @@ import ingestRouter from './routes/ingest';
 import adminRouter from './routes/admin';
 import commandsRouter from './routes/commands';
 import dashboardControllersRouter from './routes/dashboard/controllers';
+import dashboardIrrigationRouter from './routes/dashboard/irrigation';
+import dashboardDevicesRouter from './routes/dashboard/devices';
 
 dotenv.config();
 
@@ -66,6 +68,8 @@ app.use('/api/v5', ingestRouter);
 app.use('/api/v1.5/controllers', commandsRouter);
 app.use('/dashboard/admin', adminRouter);
 app.use('/dashboard/controllers', dashboardControllersRouter);
+app.use('/dashboard/irrigation', dashboardIrrigationRouter);
+app.use('/dashboard', dashboardDevicesRouter);
 
 // Bind to localhost only — nginx proxies from outside
 app.listen(Number(PORT), '127.0.0.1', () => {
