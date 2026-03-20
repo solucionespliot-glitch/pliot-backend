@@ -5,6 +5,8 @@ import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
 import ingestRouter from './routes/ingest';
 import adminRouter from './routes/admin';
+import commandsRouter from './routes/commands';
+import dashboardControllersRouter from './routes/dashboard/controllers';
 
 dotenv.config();
 
@@ -61,7 +63,9 @@ app.get('/health', (_req, res) => {
 });
 
 app.use('/api/v5', ingestRouter);
+app.use('/api/v1.5/controllers', commandsRouter);
 app.use('/dashboard/admin', adminRouter);
+app.use('/dashboard/controllers', dashboardControllersRouter);
 
 // Bind to localhost only — nginx proxies from outside
 app.listen(Number(PORT), '127.0.0.1', () => {
