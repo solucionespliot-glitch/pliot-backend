@@ -79,17 +79,17 @@ async function requireApiKey(req: Request, res: Response, next: Function): Promi
 // ─── POST /api/v5 ────────────────────────────────────────────────────────────
 
 router.post('/', requireApiKey, async (req: Request, res: Response): Promise<void> => {
-  // 1. Validate payload
+  try { 
+    // 1. Validate payload
   const parsed = IngestSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0].message });
     return;
   }
-
-  const body      = parsed.data as Record<string, unknown>;
-  const deviceId  = body['device_id'] as string;
-  const ipAddress = req.ip ?? req.socket.remoteAddress ?? 'unknown';
-
+    const body      = parsed.data as Record<string, unknown>;
+    const deviceId  = body['device_id'] as string;
+    const ipAddress = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+   
   // 2. Look up device
   const { rows: deviceRows } = await pool.query(
     `SELECT id, enabled FROM devices WHERE device_id = $1`,
@@ -127,7 +127,8 @@ router.post('/', requireApiKey, async (req: Request, res: Response): Promise<voi
     } else if (NORM_COLUMNS.has(key)) {
       normFields[key] = value;
     } else {
-      extras[key] = value;
+      extras[key]
+       = value;
     }
   }
 
@@ -145,7 +146,11 @@ router.post('/', requireApiKey, async (req: Request, res: Response): Promise<voi
   }
 
   const normColStr = normCols.join(', ');
-  const normValStr = normCols.map((c, i) => (c === 'ts' ? 'NOW()' : `$${i}`)).join(', ');
+  let paramIdx = 1;
+  const normValStr = normCols.map((c) => {
+    if (c === 'ts') return 'NOW()';
+    return `$${paramIdx++}`;
+    }).join(', ');
 
   await pool.query(
     `INSERT INTO telemetry_norm (${normColStr}) VALUES (${normValStr})`,
@@ -159,6 +164,10 @@ router.post('/', requireApiKey, async (req: Request, res: Response): Promise<voi
   );
 
   res.json({ ok: true });
+  } catch (err) {
+    console.error('Ingest error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ─── GET /api/v5/foggers ─────────────────────────────────────────────────────
