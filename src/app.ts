@@ -9,6 +9,7 @@ import commandsRouter from './routes/commands';
 import dashboardControllersRouter from './routes/dashboard/controllers';
 import dashboardIrrigationRouter from './routes/dashboard/irrigation';
 import dashboardDevicesRouter from './routes/dashboard/devices';
+import dashboardFoggersRouter from './routes/dashboard/foggers';
 
 dotenv.config();
 
@@ -70,6 +71,7 @@ app.use('/dashboard/admin', adminRouter);
 app.use('/dashboard/controllers', dashboardControllersRouter);
 app.use('/dashboard/irrigation', dashboardIrrigationRouter);
 app.use('/dashboard', dashboardDevicesRouter);
+app.use('/dashboard/foggers', dashboardFoggersRouter);
 
 // Bind to localhost only — nginx proxies from outside
 app.listen(Number(PORT), '127.0.0.1', () => {
