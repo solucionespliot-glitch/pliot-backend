@@ -12,6 +12,24 @@ const TELEMETRY_COLUMNS = new Set([
   'rain', 'fertimeter',
 ]);
 
+// ─── GET /dashboard/sites ────────────────────────────────────────────────────
+router.get('/sites', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, name, latitude, longitude, timezone, enabled, created_at
+         FROM sites
+        WHERE organization_id = $1
+          AND enabled = true
+        ORDER BY name ASC`,
+      [req.user!.organization_id],
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching sites:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ─── GET /dashboard/sites/:site_id/devices ───────────────────────────────────
 router.get('/sites/:site_id/devices', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { site_id } = req.params;
