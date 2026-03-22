@@ -129,12 +129,13 @@ ON CONFLICT (id) DO NOTHING;
 -- ─── API Key ─────────────────────────────────────────────────────────────────
 -- key_id: 'test-key-demo-001'
 -- raw key value (for testing): 'pliot-test-secret-2024'
--- key_hash = SHA256 hex of raw key
+-- key_hash = bcrypt hash (cost 10) of raw key — precomputed, compatible with bcryptjs
+-- to regenerate: node -e "require('bcryptjs').hash('pliot-test-secret-2024',10).then(h=>console.log(h))"
 INSERT INTO api_keys (id, key_id, key_hash, device_id, scopes, enabled)
 VALUES (
     'aa000000-0000-0000-0000-000000000009',
     'test-key-demo-001',
-    encode(sha256('pliot-test-secret-2024'::bytea), 'hex'),
+    '$2b$10$uGQkQ/OkVyLou1N2hQVggeRHOEbXCZ1fDafjvwhz.x5QBHnKG3MLW',
     'aa000000-0000-0000-0000-000000000004',  -- linked to sensor device
     '["ingest"]'::jsonb,
     true
