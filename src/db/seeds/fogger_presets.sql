@@ -1,54 +1,33 @@
--- Seed: fogger_presets
--- Description: Global Pliot fogger behavior presets (organization_id IS NULL)
+--- Seed: Global fogger presets
+-- 3 default presets available to all organizations
 
-INSERT INTO fogger_presets (organization_id, name, behavior_config, is_global, is_active, notes)
+INSERT INTO fogger_presets (id, organization_id, name, description, duration_sec, interval_sec, active)
 VALUES
-  (
-    NULL,
-    'Invernadero alta humedad',
-    '{
-      "trigger": "vpd",
-      "threshold_on": 1.2,
-      "threshold_off": 0.8,
-      "on_seconds": 30,
-      "off_seconds": 60,
-      "schedule": { "from": "10:00", "to": "16:00" },
-      "min_interval_seconds": 120
-    }'::jsonb,
-    TRUE,
-    TRUE,
-    'Para invernaderos con alta demanda de humedad y VPD moderado'
-  ),
-  (
-    NULL,
-    'Galpón ventilado',
-    '{
-      "trigger": "vpd",
-      "threshold_on": 1.5,
-      "threshold_off": 1.0,
-      "on_seconds": 20,
-      "off_seconds": 90,
-      "schedule": { "from": "09:00", "to": "17:00" },
-      "min_interval_seconds": 180
-    }'::jsonb,
-    TRUE,
-    TRUE,
-    'Para galpones con buena ventilación y VPD alto'
-  ),
-  (
-    NULL,
-    'Sustrato intensivo',
-    '{
-      "trigger": "vpd",
-      "threshold_on": 0.9,
-      "threshold_off": 0.6,
-      "on_seconds": 45,
-      "off_seconds": 45,
-      "schedule": { "from": "08:00", "to": "18:00" },
-      "min_interval_seconds": 90
-    }'::jsonb,
-    TRUE,
-    TRUE,
-    'Para cultivos en sustrato con control intensivo de VPD'
-  )
-ON CONFLICT DO NOTHING;
+    (
+        'a1000000-0000-0000-0000-000000000001',
+        NULL,
+        'Ciclo corto',
+        'Pulsos cortos para humidificación leve. Ideal para días con baja temperatura.',
+        30,
+        300,
+        true
+    ),
+    (
+        'a1000000-0000-0000-0000-000000000002',
+        NULL,
+        'Ciclo estándar',
+        'Balance entre humidificación y consumo. Uso general para verano.',
+        60,
+        600,
+        true
+    ),
+    (
+        'a1000000-0000-0000-0000-000000000003',
+        NULL,
+        'Ciclo intensivo',
+        'Máxima humidificación para días de calor extremo o estrés hídrico.',
+        120,
+        600,
+        true
+    )
+ON CONFLICT (id) DO NOTHING;

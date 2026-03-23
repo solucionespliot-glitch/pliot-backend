@@ -4,6 +4,24 @@ import { requireAuth, requireOrg, requireRole } from '../middleware/auth';
 
 const router = Router();
 
+// GET /dashboard/admin/security-alerts
+router.get('/security-alerts', requireAuth, requireOrg, (_req: Request, res: Response) => {
+  try {
+    res.json({ alerts: [] });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /dashboard/admin/organizations
+router.get('/organizations', requireAuth, requireOrg, (_req: Request, res: Response) => {
+  try {
+    res.json({ organizations: [] });
+  } catch (err) {
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 const ImpersonateSchema = z.object({
   organization_id: z.string().uuid(),
 });

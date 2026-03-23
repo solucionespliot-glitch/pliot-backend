@@ -10,11 +10,12 @@ import dashboardControllersRouter from './routes/dashboard/controllers';
 import dashboardIrrigationRouter from './routes/dashboard/irrigation';
 import dashboardDevicesRouter from './routes/dashboard/devices';
 import dashboardFoggersRouter from './routes/dashboard/foggers';
+import dashboardSettingsRouter from './routes/dashboard/settings';
 
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 
 // CORS — only allow trusted origins from env
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? '')
@@ -72,6 +73,7 @@ app.use('/dashboard/controllers', dashboardControllersRouter);
 app.use('/dashboard/irrigation', dashboardIrrigationRouter);
 app.use('/dashboard', dashboardDevicesRouter);
 app.use('/dashboard/foggers', dashboardFoggersRouter);
+app.use('/dashboard/settings', dashboardSettingsRouter);
 
 // Bind to localhost only — nginx proxies from outside
 app.listen(Number(PORT), '127.0.0.1', () => {
