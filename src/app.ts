@@ -17,6 +17,9 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust nginx proxy (needed for express-rate-limit and real IP detection)
+app.set('trust proxy', 1);
+
 // CORS — only allow trusted origins from env
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? '')
   .split(',')
