@@ -155,7 +155,7 @@ router.get('/devices/:device_id/telemetry', requireAuth, requireOrg, async (req:
 // ─── GET /dashboard/devices/:id/annotations ──────────────────────────────────
 router.get('/devices/:id/annotations', requireAuth, requireOrg, (_req: Request, res: Response): void => {
   try {
-    res.json({ annotations: [] });
+    res.json([]);
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
