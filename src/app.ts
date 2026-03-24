@@ -26,7 +26,7 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? '')
   .map((o) => o.trim())
   .filter(Boolean);
 
-app.use(cors({
+const corsMiddleware = cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (e.g. device sensors, curl)
     if (!origin || allowedOrigins.includes(origin)) {
@@ -36,7 +36,11 @@ app.use(cors({
     }
   },
   credentials: true,
-}));
+});
+
+// Apply CORS only to dashboard routes — ingest is server-to-server, no CORS needed
+app.use('/dashboard', corsMiddleware);
+app.use('/api/v1.5', corsMiddleware);
 
 // Security headers
 app.use(helmet());
