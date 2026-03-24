@@ -21,7 +21,7 @@ router.get('/', requireAuth, requireOrg, async (req: Request, res: Response): Pr
         c.config_version,
         c.last_sync_at,
         d.device_id,
-        d.name AS device_name,
+        COALESCE(d.legacy_device_name, d.device_id) AS device_name,
         d.site_id,
         d.zone_id
        FROM controllers c

@@ -170,6 +170,112 @@ router.post('/', requireApiKey, async (req: Request, res: Response): Promise<voi
   }
 });
 
+// ─── POST /api/v5/lora ───────────────────────────────────────────────────────
+// Accepts ChirpStack webhook format from pliot.ar nodes
+// Extracts deviceName as device_id and parses objectJSON.DecodeDataString for telemetry
+
+router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const body = req.body;
+
+    // Support single object or array
+    const frames = Array.isArray(body) ? body : [body];
+
+    for (const frame of frames) {
+      const deviceId  = frame.deviceName as string | undefined;
+      const ipAddress = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+
+      if (!deviceId) continue;
+
+      // Look up device
+      const { rows: deviceRows } = await pool.query(
+        `SELECT id, enabled FROM devices WHERE device_id = $1`,
+        [deviceId],
+      );
+
+      if (!deviceRows[0]) {
+        await pool.query(
+          `INSERT INTO security_alerts (attempted_device_id, endpoint, ip_address, alert_type)
+           VALUES ($1, $2, $3, 'unknown_device')`,
+          [deviceId, '/api/v5/lora', ipAddress],
+        );
+        continue; // skip unknown devices, process rest of batch
+      }
+
+      const device = deviceRows[0];
+
+      // Parse sensor values from objectJSON.DecodeDataString
+      let sensorData: Record<string, unknown> = {};
+      try {
+        const decoded = JSON.parse(frame.objectJSON ?? '{}');
+        sensorData = JSON.parse(decoded.DecodeDataString ?? '{}');
+      } catch {
+        // fallback: try base64 data field
+        try {
+          sensorData = JSON.parse(Buffer.from(frame.data ?? '', 'base64').toString('utf8'));
+        } catch { /* ignore */ }
+      }
+
+      // Insert raw telemetry
+      await pool.query(
+        `INSERT INTO telemetry_raw (device_id, ts, received_at, raw_decoded, parse_status)
+         VALUES ($1, NOW(), NOW(), $2, 'ok')`,
+        [device.id, JSON.stringify(frame)],
+      );
+
+      // Normalize fields
+      const normFields: Record<string, unknown> = {};
+      const extras: Record<string, unknown>     = {};
+
+      for (const [key, value] of Object.entries(sensorData)) {
+        if (FIELD_MAP[key]) {
+          normFields[FIELD_MAP[key]] = value;
+        } else if (NORM_COLUMNS.has(key)) {
+          normFields[key] = value;
+        } else {
+          extras[key] = value;
+        }
+      }
+
+      if (Object.keys(extras).length > 0) {
+        normFields['extras'] = extras;
+      }
+
+      // Build INSERT into telemetry_norm
+      const normCols: string[]    = ['device_id', 'ts'];
+      const normParams: unknown[] = [device.id];
+
+      for (const [col, val] of Object.entries(normFields)) {
+        normCols.push(col);
+        normParams.push(col === 'extras' ? JSON.stringify(val) : val);
+      }
+
+      const normColStr = normCols.join(', ');
+      let paramIdx = 1;
+      const normValStr = normCols.map((c) => {
+        if (c === 'ts') return 'NOW()';
+        return `$${paramIdx++}`;
+      }).join(', ');
+
+      await pool.query(
+        `INSERT INTO telemetry_norm (${normColStr}) VALUES (${normValStr})`,
+        normParams,
+      );
+
+      // Update last_seen_at
+      await pool.query(
+        `UPDATE devices SET last_seen_at = NOW() WHERE id = $1`,
+        [device.id],
+      );
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Lora ingest error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // ─── GET /api/v5/foggers ─────────────────────────────────────────────────────
 
 router.get('/foggers', (_req: Request, res: Response) => {
