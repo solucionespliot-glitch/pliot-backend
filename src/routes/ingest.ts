@@ -204,6 +204,10 @@ router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise
 
       const device = deviceRows[0];
 
+      // Extract measurement timestamp from rxInfo[0].time, fallback to NOW()
+      const rxTime = frame.rxInfo?.[0]?.time;
+      const measuredAt = rxTime && !isNaN(Date.parse(rxTime)) ? new Date(rxTime).toISOString() : null;
+
       // Parse sensor values from objectJSON.DecodeDataString
       let sensorData: Record<string, unknown> = {};
       try {
@@ -219,8 +223,8 @@ router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise
       // Insert raw telemetry
       await pool.query(
         `INSERT INTO telemetry_raw (device_id, ts, received_at, raw_decoded, parse_status)
-         VALUES ($1, NOW(), NOW(), $2, 'ok')`,
-        [device.id, JSON.stringify(frame)],
+         VALUES ($1, COALESCE($2::timestamptz, NOW()), NOW(), $3, 'ok')`,
+        [device.id, measuredAt, JSON.stringify(frame)],
       );
 
       // Normalize fields
@@ -253,9 +257,11 @@ router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise
       const normColStr = normCols.join(', ');
       let paramIdx = 1;
       const normValStr = normCols.map((c) => {
-        if (c === 'ts') return 'NOW()';
+        if (c === 'ts') return measuredAt ? `$${paramIdx++}::timestamptz` : 'NOW()';
         return `$${paramIdx++}`;
       }).join(', ');
+
+      if (measuredAt) normParams.splice(1, 0, measuredAt);
 
       await pool.query(
         `INSERT INTO telemetry_norm (${normColStr}) VALUES (${normValStr})`,
