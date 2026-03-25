@@ -54,7 +54,7 @@ router.get('/sites/:site_id/devices', requireAuth, requireOrg, async (req: Reque
           d.enabled,
           d.firmware_version,
           d.last_seen_at,
-          d.last_seen_at > NOW() - INTERVAL '5 minutes' AS online,
+          d.last_seen_at > NOW() - INTERVAL '10 minutes' AS online,
           tn.ts                                         AS last_telemetry_ts,
           tn.temperature,
           tn.humidity,
