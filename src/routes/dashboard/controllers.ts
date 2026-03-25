@@ -27,7 +27,7 @@ router.get('/', requireAuth, requireOrg, async (req: Request, res: Response): Pr
        FROM controllers c
        JOIN devices d ON d.id = c.device_id
       WHERE d.organization_id = $1
-      ORDER BY d.name ASC`,
+      ORDER BY COALESCE(d.legacy_device_name, d.device_id) ASC`,
     [req.user!.organization_id],
   );
 

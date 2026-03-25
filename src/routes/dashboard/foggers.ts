@@ -18,7 +18,7 @@ router.get('/', requireAuth, requireOrg, async (req: Request, res: Response): Pr
         c.override_mode,
         c.config_version,
         d.device_id,
-        d.name                        AS device_name,
+        COALESCE(d.legacy_device_name, d.device_id) AS device_name,
         d.site_id,
         d.zone_id,
         d.last_seen_at                AS device_last_seen_at,
@@ -33,7 +33,7 @@ router.get('/', requireAuth, requireOrg, async (req: Request, res: Response): Pr
        JOIN actuators a    ON a.controller_id = c.id
       WHERE d.organization_id = $1
         AND a.actuator_type   = 'fogger'
-      ORDER BY d.name ASC, a.relay_index ASC`,
+      ORDER BY COALESCE(d.legacy_device_name, d.device_id) ASC, a.relay_index ASC`,
     [req.user!.organization_id],
   );
 
