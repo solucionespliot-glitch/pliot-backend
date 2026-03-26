@@ -12,6 +12,15 @@ const TELEMETRY_COLUMNS = new Set([
   'rain', 'fertimeter',
 ]);
 
+// ─── GET /dashboard/me ───────────────────────────────────────────────────────
+router.get('/me', requireAuth, requireOrg, (req: Request, res: Response): void => {
+  res.json({
+    auth0_sub:       req.user!.auth0_sub,
+    organization_id: req.user!.organization_id,
+    role:            req.user!.role,
+  });
+});
+
 // ─── GET /dashboard/sites ────────────────────────────────────────────────────
 router.get('/sites', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   try {
