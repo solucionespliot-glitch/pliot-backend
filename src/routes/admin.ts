@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { requireAuth, requireOrg, requireRole } from '../middleware/auth';
+import { pool } from '../db';
 
 const router = Router();
 
@@ -14,9 +15,12 @@ router.get('/security-alerts', requireAuth, requireOrg, (_req: Request, res: Res
 });
 
 // GET /dashboard/admin/organizations
-router.get('/organizations', requireAuth, requireOrg, (_req: Request, res: Response) => {
+router.get('/organizations', requireAuth, requireOrg, requireRole(['superuser']), async (_req: Request, res: Response) => {
   try {
-    res.json({ organizations: [] });
+    const { rows } = await pool.query<{ id: string; name: string }>(
+      `SELECT id, name FROM organizations WHERE enabled = true ORDER BY name`,
+    );
+    res.json({ organizations: rows });
   } catch (err) {
     res.status(500).json({ error: 'Internal server error' });
   }
