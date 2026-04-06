@@ -72,7 +72,7 @@ router.get('/presets', requireAuth, requireOrg, async (req: Request, res: Respon
 const FoggerConfigSchema = z.object({
   trigger:              z.literal('vpd'),
   threshold_on:         z.number().positive(),
-  threshold_off:        z.number().positive(),
+  threshold_off:        z.number().nonnegative(),
   on_seconds:           z.number().int().positive(),
   off_seconds:          z.number().int().positive(),
   schedule:             z.object({
@@ -80,6 +80,9 @@ const FoggerConfigSchema = z.object({
     to:   z.string().regex(/^\d{2}:\d{2}$/, 'schedule.to must be HH:MM'),
   }),
   min_interval_seconds: z.number().int().positive(),
+  // Cascade / relay sequencing — stored per actuator, controller reads from actuator[0]
+  relay_mode:           z.enum(['cascade', 'independent']).optional().default('cascade'),
+  cascade_delay_ms:     z.number().int().min(0).max(5000).optional().default(500),
 });
 
 router.patch(

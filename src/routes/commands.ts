@@ -7,6 +7,218 @@ const router = Router();
 
 const requireCommandScope = requireApiKeyScope('command');
 
+// ─── GET /api/v1.5/controllers/:id/snapshot ──────────────────────────────────
+// Full config snapshot for a controller identified by device_id.
+// Called by the device at boot and after receiving a requestSync command.
+// Returns controller settings, all fogger actuators with behavior_config,
+// and the influence nodes (sensor devices) for each actuator.
+
+router.get('/:id/snapshot', requireCommandScope, async (req: Request, res: Response): Promise<void> => {
+  const { id } = req.params;
+
+  const { rows: ctrlRows } = await pool.query(
+    `SELECT
+        c.id,
+        c.mode,
+        c.config_version,
+        c.heartbeat_interval_seconds,
+        c.override_mode,
+        c.override_expires_at,
+        c.context
+       FROM controllers c
+       JOIN devices d ON d.id = c.device_id
+      WHERE d.device_id = $1`,
+    [id],
+  );
+
+  if (!ctrlRows[0]) {
+    res.status(404).json({ error: 'Controller not found' });
+    return;
+  }
+
+  const ctrl = ctrlRows[0];
+
+  const { rows: actuatorRows } = await pool.query(
+    `SELECT
+        a.id,
+        a.label,
+        a.relay_index,
+        a.enabled,
+        a.behavior_type,
+        a.behavior_config,
+        a.default_safe_state
+       FROM actuators a
+      WHERE a.controller_id = $1
+        AND a.actuator_type = 'fogger'
+      ORDER BY a.relay_index ASC`,
+    [ctrl.id],
+  );
+
+  // Attach influence node device_ids to each actuator
+  const actuators = await Promise.all(
+    actuatorRows.map(async (act) => {
+      const { rows: nodeRows } = await pool.query(
+        `SELECT d.device_id AS sensor_id
+           FROM actuator_influence_nodes ain
+           JOIN devices d ON d.id = ain.sensor_device_id
+          WHERE ain.actuator_id = $1`,
+        [act.id],
+      );
+      return { ...act, influence_nodes: nodeRows.map((n) => n.sensor_id) };
+    }),
+  );
+
+  // Mark controller as synced
+  await pool.query(
+    `UPDATE controllers
+        SET last_sync_at = NOW(),
+            sync_status  = 'synced',
+            updated_at   = NOW()
+      WHERE id = $1`,
+    [ctrl.id],
+  );
+
+  res.json({
+    controller: {
+      id:                         ctrl.id,
+      mode:                       ctrl.mode,
+      config_version:             ctrl.config_version,
+      heartbeat_interval_seconds: ctrl.heartbeat_interval_seconds,
+      override_mode:              ctrl.override_mode,
+      override_expires_at:        ctrl.override_expires_at,
+      context:                    ctrl.context ?? {},
+    },
+    actuators,
+  });
+});
+
+// ─── POST /api/v1.5/controllers/:id/heartbeat ────────────────────────────────
+// Device reports liveness and current operational state.
+// Updates online status, sync_status, and persists runtime state in context.
+// Response tells the device whether to immediately poll for pending commands.
+
+const HeartbeatSchema = z.object({
+  config_version: z.number().int().nonnegative(),
+  relay_states:   z.array(z.boolean()).max(8).optional(),
+  cycle_state:    z.enum(['IDLE', 'CYCLE_ON', 'CYCLE_OFF']).optional(),
+  last_vpd:       z.number().optional(),
+  uptime_seconds: z.number().int().nonnegative().optional(),
+  wifi_rssi:      z.number().int().optional(),
+});
+
+router.post('/:id/heartbeat', requireCommandScope, async (req: Request, res: Response): Promise<void> => {
+  const { id } = req.params;
+
+  const parsed = HeartbeatSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0].message });
+    return;
+  }
+
+  const { config_version, relay_states, cycle_state, last_vpd, uptime_seconds, wifi_rssi } = parsed.data;
+
+  const { rows } = await pool.query(
+    `SELECT c.id, c.config_version, c.context
+       FROM controllers c
+       JOIN devices d ON d.id = c.device_id
+      WHERE d.device_id = $1`,
+    [id],
+  );
+
+  if (!rows[0]) {
+    res.status(404).json({ error: 'Controller not found' });
+    return;
+  }
+
+  const ctrl       = rows[0];
+  const inSync     = ctrl.config_version === config_version;
+  const runtimeCtx = {
+    ...(ctrl.context ?? {}),
+    last_relay_states:   relay_states   ?? null,
+    last_cycle_state:    cycle_state    ?? null,
+    last_vpd:            last_vpd       ?? null,
+    last_uptime_seconds: uptime_seconds ?? null,
+    last_wifi_rssi:      wifi_rssi      ?? null,
+  };
+
+  await pool.query(
+    `UPDATE controllers
+        SET online       = TRUE,
+            last_seen_at = NOW(),
+            last_sync_at = CASE WHEN $2 THEN NOW() ELSE last_sync_at END,
+            sync_status  = CASE WHEN $2 THEN 'synced' ELSE 'pending' END,
+            context      = $3::jsonb,
+            updated_at   = NOW()
+      WHERE id = $1`,
+    [ctrl.id, inSync, JSON.stringify(runtimeCtx)],
+  );
+
+  // Check for pending commands so device can poll immediately if needed
+  const { rows: cmdRows } = await pool.query(
+    `SELECT 1 FROM commands
+      WHERE target_controller_id = $1
+        AND state = 'PENDING'
+      LIMIT 1`,
+    [ctrl.id],
+  );
+
+  res.json({ ok: true, has_pending_commands: cmdRows.length > 0 });
+});
+
+// ─── GET /api/v1.5/controllers/:id/vpd ───────────────────────────────────────
+// Returns the latest VPD reading across all influence nodes of this controller.
+// The firmware polls this to drive the fogger state machine when WiFi is available.
+// Response includes age_seconds so the device can decide if the reading is stale.
+
+router.get('/:id/vpd', requireCommandScope, async (req: Request, res: Response): Promise<void> => {
+  const { id } = req.params;
+
+  // Resolve controller UUID from device_id string
+  const { rows: ctrlRows } = await pool.query(
+    `SELECT c.id
+       FROM controllers c
+       JOIN devices d ON d.id = c.device_id
+      WHERE d.device_id = $1`,
+    [id],
+  );
+
+  if (!ctrlRows[0]) {
+    res.status(404).json({ error: 'Controller not found' });
+    return;
+  }
+
+  // Latest VPD from any influence node of this controller's actuators,
+  // ordered by recency — take the freshest reading
+  const { rows } = await pool.query(
+    `SELECT
+        tn.vpd,
+        d.device_id   AS source,
+        tn.ts,
+        EXTRACT(EPOCH FROM (NOW() - tn.ts))::int AS age_seconds
+       FROM actuators a
+       JOIN actuator_influence_nodes ain ON ain.actuator_id = a.id
+       JOIN devices d                   ON d.id = ain.sensor_device_id
+       JOIN telemetry_norm tn           ON tn.device_id = d.id
+                                       AND tn.vpd IS NOT NULL
+      WHERE a.controller_id = $1
+      ORDER BY tn.ts DESC
+      LIMIT 1`,
+    [ctrlRows[0].id],
+  );
+
+  if (!rows[0]) {
+    res.status(404).json({ error: 'No VPD data available from influence nodes' });
+    return;
+  }
+
+  res.json({
+    vpd:         rows[0].vpd,
+    source:      rows[0].source,
+    ts:          rows[0].ts,
+    age_seconds: rows[0].age_seconds,
+  });
+});
+
 // GET /api/v1.5/controllers/:id/commands
 // Returns all PENDING commands for the controller identified by device_id
 router.get('/:id/commands', requireCommandScope, async (req: Request, res: Response): Promise<void> => {

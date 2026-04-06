@@ -77,4 +77,49 @@ router.patch(
   },
 );
 
+// ─── PATCH /dashboard/controllers/:id/context ────────────────────────────────
+// Update controller-level settings stored in context JSONB.
+// Currently used for relay_mode and cascade_delay_ms.
+// Merges with existing context — does not overwrite unrelated fields.
+
+const ControllerContextSchema = z.object({
+  relay_mode:       z.enum(['cascade', 'independent']).optional(),
+  cascade_delay_ms: z.number().int().min(0).max(5000).optional(),
+});
+
+router.patch(
+  '/:id/context',
+  requireAuth,
+  requireOrg,
+  requireRole(['producer', 'operator', 'superuser', 'distributor']),
+  async (req: Request, res: Response): Promise<void> => {
+    const parsed = ControllerContextSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0].message });
+      return;
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE controllers c
+          SET context      = COALESCE(c.context, '{}'::jsonb) || $1::jsonb,
+              sync_status  = 'pending',
+              config_version = c.config_version + 1,
+              updated_at   = NOW()
+         FROM devices d
+        WHERE c.device_id       = d.id
+          AND c.id              = $2
+          AND d.organization_id = $3
+        RETURNING c.id, c.context, c.config_version, c.sync_status`,
+      [JSON.stringify(parsed.data), req.params.id, req.user!.organization_id],
+    );
+
+    if (!rows[0]) {
+      res.status(404).json({ error: 'Controller not found' });
+      return;
+    }
+
+    res.json({ ok: true, controller: rows[0] });
+  },
+);
+
 export default router;
