@@ -208,13 +208,16 @@ router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise
       const rxTime = frame.rxInfo?.[0]?.time;
       const measuredAt = rxTime && !isNaN(Date.parse(rxTime)) ? new Date(rxTime).toISOString() : null;
 
-      // Parse sensor values from objectJSON.DecodeDataString
+      // Parse sensor values: prefer objectJSON.DecodeDataString, fallback to base64 data field
       let sensorData: Record<string, unknown> = {};
       try {
         const decoded = JSON.parse(frame.objectJSON ?? '{}');
-        sensorData = JSON.parse(decoded.DecodeDataString ?? '{}');
-      } catch {
-        // fallback: try base64 data field
+        if (decoded.DecodeDataString) {
+          sensorData = JSON.parse(decoded.DecodeDataString);
+        }
+      } catch { /* ignore */ }
+
+      if (Object.keys(sensorData).length === 0) {
         try {
           sensorData = JSON.parse(Buffer.from(frame.data ?? '', 'base64').toString('utf8'));
         } catch { /* ignore */ }
