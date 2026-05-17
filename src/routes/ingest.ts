@@ -44,6 +44,35 @@ const FIELD_MAP: Record<string, string> = {
 
 const NORM_COLUMNS = new Set(Object.values(FIELD_MAP));
 
+// ─── Sensor capabilities ──────────────────────────────────────────────────────
+// Records which normalized sensor columns a device has ever reported.
+// Stored in devices.sensor_capabilities as { ppfd: true, ph: true, ... }.
+// The frontend uses this to show/hide sensor widgets per device.
+// Fire-and-forget: runs after the telemetry insert, never blocks the response.
+function updateSensorCapabilities(deviceId: string, normFields: Record<string, unknown>): void {
+  // Build capabilities object from the normalized columns present in this payload.
+  // 'extras' is excluded — it's a catch-all bucket, not a real sensor column.
+  const capabilities: Record<string, true> = {};
+  for (const col of Object.keys(normFields)) {
+    if (col !== 'extras') {
+      capabilities[col] = true;
+    }
+  }
+
+  if (Object.keys(capabilities).length === 0) return;
+
+  const capJson = JSON.stringify(capabilities);
+
+  // Only write if at least one capability is new — avoids unnecessary writes on every telemetry packet.
+  pool.query(
+    `UPDATE devices
+        SET sensor_capabilities = sensor_capabilities || $1::jsonb
+      WHERE id = $2
+        AND NOT (sensor_capabilities @> $1::jsonb)`,
+    [capJson, deviceId],
+  ).catch((err) => console.error('Failed to update sensor_capabilities:', err));
+}
+
 // ─── Auth middleware ─────────────────────────────────────────────────────────
 
 async function requireApiKey(req: Request, res: Response, next: Function): Promise<void> {
@@ -154,7 +183,10 @@ router.post('/', requireApiKey, async (req: Request, res: Response): Promise<voi
     normFields['extras'] = extras;
   }
 
-  // 5. Build and execute dynamic INSERT into telemetry_norm
+  // 5. Record which sensor columns this device reported (fire-and-forget)
+  updateSensorCapabilities(device.id, normFields);
+
+  // 6. Build and execute dynamic INSERT into telemetry_norm
   const normCols: string[]    = ['device_id', 'ts'];
   const normParams: unknown[] = [device.id];
 
@@ -265,6 +297,9 @@ router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise
       if (Object.keys(extras).length > 0) {
         normFields['extras'] = extras;
       }
+
+      // Record which sensor columns this device reported (fire-and-forget)
+      updateSensorCapabilities(device.id, normFields);
 
       // Build INSERT into telemetry_norm
       const normCols: string[]    = ['device_id', 'ts'];
