@@ -10,6 +10,12 @@ const TELEMETRY_COLUMNS = new Set([
   'light', 'co2', 'report_period', 'flow_main', 'ph', 'ec',
   'tank_level', 'scale_weight', 'wind_speed', 'wind_direction',
   'rain', 'fertimeter',
+  // Individual light sensors and PPFD (nodes with fiber optic / LDR array)
+  'light_sensor_1', 'light_sensor_2', 'light_sensor_3', 'light_sensor_4',
+  'light_sensor_5', 'light_sensor_6', 'light_sensor_7', 'light_sensor_8',
+  'ppfd',
+  // Substrate / solution sensors
+  'soil_temperature', 'ec_temperature',
 ]);
 
 // ─── GET /dashboard/me ───────────────────────────────────────────────────────
@@ -64,6 +70,7 @@ router.get('/sites/:site_id/devices', requireAuth, requireOrg, async (req: Reque
           d.firmware_version,
           d.last_seen_at,
           d.last_seen_at > NOW() - INTERVAL '10 minutes' AS online,
+          d.sensor_capabilities,
           tn.ts                                         AS last_telemetry_ts,
           tn.temperature,
           tn.humidity,
