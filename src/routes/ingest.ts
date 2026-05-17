@@ -12,8 +12,11 @@ const IngestSchema = z
     message: 'Payload must include a non-empty device_id',
   });
 
-// Short key → normalized column mapping
+// Short key → normalized column mapping.
+// Keys are the abbreviated field names sent by hardware nodes.
+// Values are the corresponding column names in telemetry_norm.
 const FIELD_MAP: Record<string, string> = {
+  // Environmental sensors (all node types)
   b:    'battery_voltage',
   t:    'temperature',
   h:    'humidity',
@@ -22,6 +25,21 @@ const FIELD_MAP: Record<string, string> = {
   l:    'light',
   pR:   'report_period',
   co2r: 'co2',
+  // Individual light sensors — nodes with fiber optic / LDR array (e.g. Nodo 400)
+  l1:   'light_sensor_1',
+  l2:   'light_sensor_2',
+  l3:   'light_sensor_3',
+  l4:   'light_sensor_4',
+  l5:   'light_sensor_5',
+  l6:   'light_sensor_6',
+  l7:   'light_sensor_7',
+  l8:   'light_sensor_8',
+  lt:   'ppfd',             // Total PPFD (µmol/m²·s), sum of light array
+  // Substrate / solution sensors (e.g. Nodos 409, 410)
+  ht:   'soil_temperature', // Substrate or solution temperature (°C)
+  hp:   'ph',               // pH of solution
+  et:   'ec_temperature',   // EC probe temperature (°C)
+  ee:   'ec',               // Electrical conductivity (mS/cm)
 };
 
 const NORM_COLUMNS = new Set(Object.values(FIELD_MAP));
