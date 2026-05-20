@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
+import { createCipheriv } from 'crypto';
 import { z } from 'zod';
 import { pool } from '../db';
 
@@ -71,6 +72,163 @@ function updateSensorCapabilities(deviceId: string, normFields: Record<string, u
         AND NOT (sensor_capabilities @> $1::jsonb)`,
     [capJson, deviceId],
   ).catch((err) => console.error('Failed to update sensor_capabilities:', err));
+}
+
+// ─── LoRaWAN ABP decryption ───────────────────────────────────────────────────
+// Handles raw LoRaWAN frames forwarded by the GL controller firmware.
+// The network_server.js path (old VPS) already decrypts before forwarding,
+// so this is only needed for the direct controller → backend path.
+
+// AES-128-ECB: encrypt a single 16-byte block with the given key.
+function aes128Ecb(key: Buffer, block: Buffer): Buffer {
+  const cipher = createCipheriv('aes-128-ecb', key, null);
+  cipher.setAutoPadding(false);
+  return Buffer.concat([cipher.update(block), cipher.final()]) as Buffer;
+}
+
+// AES-CMAC: used to verify the LoRaWAN MIC (Message Integrity Code).
+// Implements RFC 4493.
+function aesCmac(key: Buffer, message: Buffer): Buffer {
+  // Generate subkeys K1, K2 from AES(key, 0^16)
+  const L = aes128Ecb(key, Buffer.alloc(16));
+
+  function shiftLeft(buf: Buffer): Buffer {
+    const out = Buffer.alloc(16);
+    for (let i = 0; i < 15; i++) out[i] = ((buf[i] << 1) | (buf[i + 1] >> 7)) & 0xff;
+    out[15] = (buf[15] << 1) & 0xff;
+    return out;
+  }
+
+  const k1 = shiftLeft(L);
+  if (L[0] & 0x80) k1[15] ^= 0x87;
+  const k2 = shiftLeft(k1);
+  if (k1[0] & 0x80) k2[15] ^= 0x87;
+
+  const n = Math.max(1, Math.ceil(message.length / 16));
+  const lastComplete = message.length > 0 && message.length % 16 === 0;
+
+  let x: Buffer = Buffer.alloc(16);
+
+  for (let i = 0; i < n - 1; i++) {
+    const block = message.slice(i * 16, (i + 1) * 16);
+    const y = Buffer.alloc(16);
+    for (let j = 0; j < 16; j++) y[j] = x[j] ^ block[j];
+    x = aes128Ecb(key, y);
+  }
+
+  // Last block: pad if incomplete, then XOR with K1 or K2
+  const last = Buffer.alloc(16);
+  const lastData = message.slice((n - 1) * 16);
+  lastData.copy(last);
+  if (!lastComplete) {
+    last[lastData.length] = 0x80; // ISO/IEC 9797-1 padding
+    for (let j = 0; j < 16; j++) last[j] ^= k2[j];
+  } else {
+    for (let j = 0; j < 16; j++) last[j] ^= k1[j];
+  }
+
+  const y = Buffer.alloc(16);
+  for (let j = 0; j < 16; j++) y[j] = x[j] ^ last[j];
+  return aes128Ecb(key, y);
+}
+
+// Decrypt LoRaWAN FRMPayload using AppSKey (AES-128 CTR-like, LoRaWAN spec 1.0).
+// devAddrBuf: 4 bytes little-endian as they appear in the frame.
+// fCnt: 16-bit uplink frame counter.
+function decryptFrmPayload(appSKey: Buffer, devAddrBuf: Buffer, fCnt: number, payload: Buffer): Buffer {
+  const result = Buffer.alloc(payload.length);
+  const numBlocks = Math.ceil(payload.length / 16);
+
+  for (let i = 1; i <= numBlocks; i++) {
+    // Build A block: 01 00 00 00 00 [Dir=00] [DevAddr LE 4B] [FCnt LE 2B] 00 00 00 [i]
+    const a = Buffer.alloc(16);
+    a[0] = 0x01;
+    // a[1..4] = 0x00 (already zero)
+    // a[5] = 0x00 (Dir = uplink)
+    devAddrBuf.copy(a, 6);      // bytes 6-9: DevAddr little-endian
+    a[10] = fCnt & 0xff;        // FCnt LSB
+    a[11] = (fCnt >> 8) & 0xff; // FCnt MSB
+    // a[12..14] = 0x00 (FCnt upper bytes, always 0 for 16-bit counter)
+    a[15] = i;                  // block counter (1-indexed)
+
+    const s = aes128Ecb(appSKey, a);
+    const start = (i - 1) * 16;
+    const end = Math.min(start + 16, payload.length);
+    for (let j = start; j < end; j++) result[j] = payload[j] ^ s[j - start];
+  }
+
+  return result;
+}
+
+// Decode a raw LoRaWAN ABP uplink frame (base64-encoded).
+// Returns the decrypted sensor data object, or null if MIC fails or parse fails.
+function decodeAbpFrame(
+  frameB64: string,
+  appSKeyHex: string,
+  nwkSKeyHex: string,
+): Record<string, unknown> | null {
+  let frame: Buffer;
+  try {
+    frame = Buffer.from(frameB64, 'base64');
+  } catch {
+    return null;
+  }
+
+  // Minimum frame: MHDR(1) + DevAddr(4) + FCtrl(1) + FCnt(2) + FPort(1) + payload(1) + MIC(4) = 14 bytes
+  if (frame.length < 14) return null;
+
+  // Only handle Unconfirmed Data Up (0x40) and Confirmed Data Up (0x80)
+  const mhdr = frame[0];
+  if (mhdr !== 0x40 && mhdr !== 0x80) return null;
+
+  const devAddrBuf = frame.slice(1, 5); // DevAddr, little-endian
+  const fCtrl      = frame[5];
+  const fOptsLen   = fCtrl & 0x0f;     // lower 4 bits = FOpts length
+  const fCnt       = frame[6] | (frame[7] << 8);
+
+  // FPort sits after FHDR (1+4+1+2 = 8 bytes) + FOpts
+  const fPortOffset = 8 + fOptsLen;
+  if (frame.length <= fPortOffset + 4) return null; // no room for FPort + payload + MIC
+
+  const frmPayloadStart = fPortOffset + 1;
+  const frmPayloadEnd   = frame.length - 4; // exclude 4-byte MIC
+  if (frmPayloadEnd <= frmPayloadStart) return null;
+
+  const frmPayload = frame.slice(frmPayloadStart, frmPayloadEnd);
+  const rxMic      = frame.slice(frame.length - 4);
+
+  // Verify MIC using NwkSKey.
+  // B0 = 49 00 00 00 00 [Dir=00] [DevAddr LE 4B] [FCnt LE 2B] 00 00 00 [msgLen]
+  const macPayload = frame.slice(1, frame.length - 4);
+  const msgLen     = macPayload.length + 1; // +1 for MHDR byte
+  const b0         = Buffer.alloc(16);
+  b0[0] = 0x49;
+  // b0[1..4] = 0x00 (zeros)
+  // b0[5] = 0x00 (Dir = uplink)
+  devAddrBuf.copy(b0, 6);
+  b0[10] = fCnt & 0xff;
+  b0[11] = (fCnt >> 8) & 0xff;
+  // b0[12..14] = 0x00
+  b0[15] = msgLen & 0xff;
+
+  const nwkSKey = Buffer.from(nwkSKeyHex, 'hex');
+  const micMsg  = Buffer.concat([b0, frame.slice(0, 1), macPayload]); // B0 || MHDR || MACPayload
+  const cmac    = aesCmac(nwkSKey, micMsg);
+
+  if (!cmac.slice(0, 4).equals(rxMic)) {
+    // MIC mismatch — wrong keys or corrupted frame
+    return null;
+  }
+
+  // Decrypt FRMPayload with AppSKey
+  const appSKey   = Buffer.from(appSKeyHex, 'hex');
+  const decrypted = decryptFrmPayload(appSKey, devAddrBuf, fCnt, frmPayload);
+
+  try {
+    return JSON.parse(decrypted.toString('utf8')) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Auth middleware ─────────────────────────────────────────────────────────
@@ -237,41 +395,81 @@ router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise
 
       if (!deviceId) continue;
 
-      // Look up device
-      const { rows: deviceRows } = await pool.query(
-        `SELECT id, enabled FROM devices WHERE device_id = $1`,
-        [deviceId],
+      // ── Device lookup ────────────────────────────────────────────────────────
+      // Two paths depending on the source of the frame:
+      //
+      // Path A — GL controller (raw ABP frame):
+      //   deviceName = DevAddr hex (e.g. '01FF0703'). The frame.data field contains
+      //   the raw encrypted LoRaWAN frame. We look up the ABP keys and decrypt.
+      //
+      // Path B — network_server.js via VPS viejo mirror:
+      //   deviceName = human-readable name (e.g. 'ASN-MVP-104'). The frame.data
+      //   field contains the already-decoded sensor JSON in base64. Normal path.
+
+      let device: { id: string; enabled: boolean } | undefined;
+      let sensorData: Record<string, unknown> = {};
+
+      // Try ABP path first: look up DevAddr in lora_abp_keys
+      const { rows: abpRows } = await pool.query(
+        `SELECT k.app_s_key, k.nwk_s_key, d.id, d.enabled
+           FROM lora_abp_keys k
+           JOIN devices d ON d.id = k.device_id
+          WHERE k.dev_addr = $1`,
+        [deviceId.toUpperCase()],
       );
 
-      if (!deviceRows[0]) {
-        await pool.query(
-          `INSERT INTO security_alerts (attempted_device_id, endpoint, ip_address, alert_type)
-           VALUES ($1, $2, $3, 'unknown_device')`,
-          [deviceId, '/api/v5/lora', ipAddress],
+      if (abpRows[0]) {
+        // Path A: raw ABP frame — decrypt and extract sensor data
+        const abpKey = abpRows[0];
+        const decoded = decodeAbpFrame(frame.data ?? '', abpKey.app_s_key, abpKey.nwk_s_key);
+
+        if (!decoded) {
+          // MIC failed or malformed frame — log and skip, don't alert (could be noise)
+          console.warn(`[LoRa ABP] MIC fail or parse error for DevAddr ${deviceId}`);
+          continue;
+        }
+
+        device = { id: abpKey.id, enabled: abpKey.enabled };
+        sensorData = decoded;
+
+      } else {
+        // Path B: normal device lookup by deviceName
+        const { rows: deviceRows } = await pool.query(
+          `SELECT id, enabled FROM devices WHERE device_id = $1`,
+          [deviceId],
         );
-        continue; // skip unknown devices, process rest of batch
+
+        if (!deviceRows[0]) {
+          await pool.query(
+            `INSERT INTO security_alerts (attempted_device_id, endpoint, ip_address, alert_type)
+             VALUES ($1, $2, $3, 'unknown_device')`,
+            [deviceId, '/api/v5/lora', ipAddress],
+          );
+          continue; // skip unknown devices, process rest of batch
+        }
+
+        device = deviceRows[0];
+
+        // Parse sensor values: prefer objectJSON.DecodeDataString, fallback to base64 data field
+        try {
+          const decoded = JSON.parse(frame.objectJSON ?? '{}');
+          if (decoded.DecodeDataString) {
+            sensorData = JSON.parse(decoded.DecodeDataString);
+          }
+        } catch { /* ignore */ }
+
+        if (Object.keys(sensorData).length === 0) {
+          try {
+            sensorData = JSON.parse(Buffer.from(frame.data ?? '', 'base64').toString('utf8'));
+          } catch { /* ignore */ }
+        }
       }
 
-      const device = deviceRows[0];
+      if (!device || !device.enabled) continue;
 
       // Extract measurement timestamp from rxInfo[0].time, fallback to NOW()
-      const rxTime = frame.rxInfo?.[0]?.time;
+      const rxTime    = frame.rxInfo?.[0]?.time as string | undefined;
       const measuredAt = rxTime && !isNaN(Date.parse(rxTime)) ? new Date(rxTime).toISOString() : null;
-
-      // Parse sensor values: prefer objectJSON.DecodeDataString, fallback to base64 data field
-      let sensorData: Record<string, unknown> = {};
-      try {
-        const decoded = JSON.parse(frame.objectJSON ?? '{}');
-        if (decoded.DecodeDataString) {
-          sensorData = JSON.parse(decoded.DecodeDataString);
-        }
-      } catch { /* ignore */ }
-
-      if (Object.keys(sensorData).length === 0) {
-        try {
-          sensorData = JSON.parse(Buffer.from(frame.data ?? '', 'base64').toString('utf8'));
-        } catch { /* ignore */ }
-      }
 
       // Insert raw telemetry
       await pool.query(
