@@ -187,21 +187,29 @@ router.get('/:id/vpd', requireCommandScope, async (req: Request, res: Response):
     return;
   }
 
-  // Latest VPD from any influence node of this controller's actuators,
-  // ordered by recency — take the freshest reading
+  // For each influence node get its most recent non-stale VPD reading,
+  // then return the node with the highest VPD (most conservative: act when
+  // any zone needs it). Nodes with no reading in the last 5 min are excluded —
+  // if a node fails, the remaining active nodes still drive the decision.
   const { rows } = await pool.query(
-    `SELECT
-        tn.vpd,
-        d.device_id   AS source,
-        tn.ts,
-        EXTRACT(EPOCH FROM (NOW() - tn.ts))::int AS age_seconds
-       FROM actuators a
-       JOIN actuator_influence_nodes ain ON ain.actuator_id = a.id
-       JOIN devices d                   ON d.id = ain.sensor_device_id
-       JOIN telemetry_norm tn           ON tn.device_id = d.id
-                                       AND tn.vpd IS NOT NULL
-      WHERE a.controller_id = $1
-      ORDER BY tn.ts DESC
+    `WITH latest_per_node AS (
+        SELECT DISTINCT ON (d.id)
+            d.device_id AS source,
+            tn.vpd,
+            tn.ts,
+            EXTRACT(EPOCH FROM (NOW() - tn.ts))::int AS age_seconds
+          FROM actuators a
+          JOIN actuator_influence_nodes ain ON ain.actuator_id = a.id
+          JOIN devices d                   ON d.id = ain.sensor_device_id
+          JOIN telemetry_norm tn           ON tn.device_id = d.id
+                                          AND tn.vpd IS NOT NULL
+         WHERE a.controller_id = $1
+           AND tn.ts > NOW() - INTERVAL '5 minutes'
+         ORDER BY d.id, tn.ts DESC
+     )
+     SELECT vpd, source, ts, age_seconds
+       FROM latest_per_node
+      ORDER BY vpd DESC
       LIMIT 1`,
     [ctrlRows[0].id],
   );
