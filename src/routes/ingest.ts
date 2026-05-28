@@ -327,13 +327,16 @@ router.post('/', requireApiKey, async (req: Request, res: Response): Promise<voi
   for (const [key, value] of Object.entries(body)) {
     if (key === 'device_id') continue;
 
+    // Some sensors send the string "null" when a reading is unavailable.
+    // Skip those for normalized columns — inserting "null" into a numeric column fails.
+    const isNullish = value === null || value === undefined || value === 'null';
+
     if (FIELD_MAP[key]) {
-      normFields[FIELD_MAP[key]] = value;
+      if (!isNullish) normFields[FIELD_MAP[key]] = value;
     } else if (NORM_COLUMNS.has(key)) {
-      normFields[key] = value;
+      if (!isNullish) normFields[key] = value;
     } else {
-      extras[key]
-       = value;
+      extras[key] = value;
     }
   }
 
@@ -483,10 +486,14 @@ router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise
       const extras: Record<string, unknown>     = {};
 
       for (const [key, value] of Object.entries(sensorData)) {
+        // Some sensors send the string "null" when a reading is unavailable.
+        // Skip those for normalized columns — inserting "null" into a numeric column fails.
+        const isNullish = value === null || value === undefined || value === 'null';
+
         if (FIELD_MAP[key]) {
-          normFields[FIELD_MAP[key]] = value;
+          if (!isNullish) normFields[FIELD_MAP[key]] = value;
         } else if (NORM_COLUMNS.has(key)) {
-          normFields[key] = value;
+          if (!isNullish) normFields[key] = value;
         } else {
           extras[key] = value;
         }
