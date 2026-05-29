@@ -16,6 +16,10 @@ const TELEMETRY_COLUMNS = new Set([
   'ppfd',
   // Substrate / solution sensors
   'soil_temperature', 'ec_temperature',
+  // Capacitive soil moisture sensor (FSN-703-olmo)
+  'soil_moisture_cap', 'soil_temp_cap',
+  // RIKA NPK 7-in-1 sensor (olmov-FSN-702)
+  'rika_moisture', 'rika_temperature', 'rika_ec', 'rika_ph',
 ]);
 
 // ─── GET /dashboard/me ───────────────────────────────────────────────────────
@@ -82,6 +86,12 @@ router.get('/sites/:site_id/devices', requireAuth, requireOrg, async (req: Reque
           tn.ph,
           tn.ec,
           tn.tank_level,
+          tn.soil_moisture_cap,
+          tn.soil_temp_cap,
+          tn.rika_moisture,
+          tn.rika_temperature,
+          tn.rika_ec,
+          tn.rika_ph,
           tn.extras
          FROM devices d
          LEFT JOIN zones z ON z.id = d.zone_id

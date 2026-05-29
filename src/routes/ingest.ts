@@ -41,6 +41,14 @@ const FIELD_MAP: Record<string, string> = {
   hp:   'ph',               // pH of solution
   et:   'ec_temperature',   // EC probe temperature (°C)
   ee:   'ec',               // Electrical conductivity (mS/cm)
+  // Capacitive soil moisture sensor (e.g. FSN-703-olmo)
+  hf:   'soil_moisture_cap',  // Soil moisture from capacitive probe, %
+  tf:   'soil_temp_cap',      // Temperature from capacitive probe, °C
+  // RIKA NPK 7-in-1 sensor (e.g. olmov-FSN-702)
+  h7:   'rika_moisture',      // RIKA soil moisture/VWC, %
+  t7:   'rika_temperature',   // RIKA soil temperature, °C
+  e7:   'rika_ec',            // RIKA electrical conductivity
+  ph7:  'rika_ph',            // RIKA pH
 };
 
 const NORM_COLUMNS = new Set(Object.values(FIELD_MAP));
