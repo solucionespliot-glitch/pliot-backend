@@ -11,6 +11,7 @@ import dashboardIrrigationRouter from './routes/dashboard/irrigation';
 import dashboardDevicesRouter from './routes/dashboard/devices';
 import dashboardFoggersRouter from './routes/dashboard/foggers';
 import dashboardSettingsRouter from './routes/dashboard/settings';
+import dashboardLotsRouter from './routes/dashboard/lots';
 
 dotenv.config();
 
@@ -81,6 +82,7 @@ app.use('/dashboard/irrigation', dashboardIrrigationRouter);
 app.use('/dashboard', dashboardDevicesRouter);
 app.use('/dashboard/foggers', dashboardFoggersRouter);
 app.use('/dashboard/settings', dashboardSettingsRouter);
+app.use('/dashboard', dashboardLotsRouter);
 
 // Bind to localhost only — nginx proxies from outside
 app.listen(Number(PORT), '127.0.0.1', () => {
