@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { z } from 'zod';
 import { pool } from '../../db';
 import { requireAuth, requireOrg } from '../../middleware/auth';
 
@@ -66,7 +67,7 @@ router.get('/sites/:site_id/devices', requireAuth, requireOrg, async (req: Reque
       `SELECT
           d.id,
           d.device_id,
-          COALESCE(d.legacy_device_name, d.device_id) AS display_name,
+          COALESCE(d.display_name, d.legacy_device_name, d.device_id) AS display_name,
           d.device_type,
           d.zone_id,
           z.name                                        AS zone_name,
@@ -111,6 +112,44 @@ router.get('/sites/:site_id/devices', requireAuth, requireOrg, async (req: Reque
     res.json({ devices: rows });
   } catch (err) {
     console.error('Error fetching devices:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ─── PATCH /dashboard/devices/:device_id ─────────────────────────────────────
+// Updates editable device fields. Currently supports: display_name.
+const patchDeviceSchema = z.object({
+  display_name: z.string().trim().min(1).max(100),
+});
+
+router.patch('/devices/:device_id', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  const { device_id } = req.params;
+
+  const parsed = patchDeviceSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0].message });
+    return;
+  }
+
+  const { display_name } = parsed.data;
+
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE devices
+          SET display_name = $1, updated_at = NOW()
+        WHERE device_id = $2
+          AND organization_id = $3`,
+      [display_name, device_id, req.user!.organization_id],
+    );
+
+    if (rowCount === 0) {
+      res.status(404).json({ error: 'Device not found' });
+      return;
+    }
+
+    res.json({ ok: true, display_name });
+  } catch (err) {
+    console.error('Error updating device display_name:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

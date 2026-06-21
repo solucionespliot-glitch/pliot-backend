@@ -88,6 +88,22 @@ CREATE TABLE IF NOT EXISTS telemetry_raw_2026_04
   PARTITION OF telemetry_raw
   FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
 
+CREATE TABLE IF NOT EXISTS telemetry_raw_2026_05
+  PARTITION OF telemetry_raw
+  FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+
+CREATE TABLE IF NOT EXISTS telemetry_raw_2026_06
+  PARTITION OF telemetry_raw
+  FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+
+CREATE TABLE IF NOT EXISTS telemetry_raw_2026_07
+  PARTITION OF telemetry_raw
+  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+
+CREATE TABLE IF NOT EXISTS telemetry_raw_2026_08
+  PARTITION OF telemetry_raw
+  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+
 -- Monthly partitions for telemetry_norm
 CREATE TABLE IF NOT EXISTS telemetry_norm_2026_03
   PARTITION OF telemetry_norm
@@ -96,6 +112,22 @@ CREATE TABLE IF NOT EXISTS telemetry_norm_2026_03
 CREATE TABLE IF NOT EXISTS telemetry_norm_2026_04
   PARTITION OF telemetry_norm
   FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+
+CREATE TABLE IF NOT EXISTS telemetry_norm_2026_05
+  PARTITION OF telemetry_norm
+  FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+
+CREATE TABLE IF NOT EXISTS telemetry_norm_2026_06
+  PARTITION OF telemetry_norm
+  FOR VALUES FROM ('2026-06-01') TO ('2026-07-01');
+
+CREATE TABLE IF NOT EXISTS telemetry_norm_2026_07
+  PARTITION OF telemetry_norm
+  FOR VALUES FROM ('2026-07-01') TO ('2026-08-01');
+
+CREATE TABLE IF NOT EXISTS telemetry_norm_2026_08
+  PARTITION OF telemetry_norm
+  FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
 
 -- Indexes on telemetry_norm
 CREATE INDEX IF NOT EXISTS idx_telemetry_norm_device_ts
