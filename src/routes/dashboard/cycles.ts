@@ -97,7 +97,14 @@ router.get('/crop-types', requireAuth, async (_req: Request, res: Response): Pro
 });
 
 // ── GET /dashboard/cycles/:cycle_id ──────────────────────────────────────────
-// Returns a single cycle with days_without_monitoring. Used by CycleDetailModule.
+// Returns a single cycle with days_without_monitoring and degree_days.
+//
+// Degree-day accumulator strategy (lazy/incremental):
+//   - lot_cycles stores degree_days_to_date (total up to degree_days_calc_date)
+//   - On each request: if calc_date < yesterday, calculate the missing completed
+//     days and persist the updated total (fast — only processes new days)
+//   - Always add today's partial live from telemetry_norm (current-day readings)
+//   - Result: accurate to the minute without recalculating the full history
 router.get('/cycles/:cycle_id', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { cycle_id } = req.params;
 
@@ -107,6 +114,8 @@ router.get('/cycles/:cycle_id', requireAuth, requireOrg, async (req: Request, re
           c.id, c.lot_id, c.name, c.crop_type, c.base_temp,
           c.started_at, c.ended_at, c.monitoring_frequency_days,
           c.notes, c.created_by, c.created_at,
+          c.degree_days_to_date,
+          c.degree_days_calc_date,
           m.last_monitored_at,
           CASE
             WHEN m.last_monitored_at IS NOT NULL
@@ -129,7 +138,91 @@ router.get('/cycles/:cycle_id', requireAuth, requireOrg, async (req: Request, re
       return;
     }
 
-    res.json({ cycle: rows[0] });
+    const cycle = rows[0];
+
+    // ── Degree-day accumulator ────────────────────────────────────────────────
+    // Fetch device UUIDs for all nodes assigned to this lot
+    const { rows: nodeRows } = await pool.query(
+      `SELECT d.id AS device_uuid
+         FROM lot_nodes ln
+         JOIN devices d ON d.id = ln.device_id
+        WHERE ln.lot_id = $1`,
+      [cycle.lot_id],
+    );
+    const deviceUuids: string[] = nodeRows.map((n: { device_uuid: string }) => n.device_uuid);
+
+    let degree_days: number | null = null;
+
+    if (deviceUuids.length > 0) {
+      const baseTemp: number = cycle.base_temp ?? 10;
+
+      // Get yesterday as YYYY-MM-DD using DB timezone to stay consistent
+      const { rows: dateRows } = await pool.query(
+        `SELECT (CURRENT_DATE - INTERVAL '1 day')::text AS yesterday`,
+      );
+      const yesterdayStr: string = dateRows[0].yesterday;
+
+      // calcDate: last date already included in the stored accumulator
+      const calcDate: string | null = cycle.degree_days_calc_date
+        ? new Date(cycle.degree_days_calc_date).toISOString().slice(0, 10)
+        : null;
+
+      let storedTotal: number = Number(cycle.degree_days_to_date ?? 0);
+
+      // If stored total doesn't cover through yesterday, catch up on completed days
+      if (calcDate === null || calcDate < yesterdayStr) {
+        // Start the day after the last calculated date, or from cycle start
+        const fromDate: string = calcDate
+          ? new Date(new Date(calcDate + 'T12:00:00Z').getTime() + 86_400_000)
+              .toISOString()
+              .slice(0, 10)
+          : cycle.started_at;
+
+        const { rows: deltaRows } = await pool.query(
+          `SELECT COALESCE(SUM(GREATEST(avg_temp - $1, 0)), 0) AS delta
+             FROM (
+               SELECT DATE_TRUNC('day', ts) AS day,
+                      AVG(temperature)      AS avg_temp
+                 FROM telemetry_norm
+                WHERE device_id = ANY($2)
+                  AND ts >= $3
+                  AND ts < CURRENT_DATE
+                  AND temperature IS NOT NULL
+                GROUP BY 1
+             ) daily`,
+          [baseTemp, deviceUuids, fromDate],
+        );
+
+        const delta = Number(deltaRows[0]?.delta ?? 0);
+        storedTotal += delta;
+
+        // Persist so the next request skips these already-processed days
+        await pool.query(
+          `UPDATE lot_cycles
+              SET degree_days_to_date   = $1,
+                  degree_days_calc_date = $2
+            WHERE id = $3`,
+          [storedTotal, yesterdayStr, cycle.id],
+        );
+      }
+
+      // Add today's partial: average of all readings received so far today
+      const { rows: todayRows } = await pool.query(
+        `SELECT GREATEST(AVG(temperature) - $1, 0) AS today_partial
+           FROM telemetry_norm
+          WHERE device_id = ANY($2)
+            AND ts >= CURRENT_DATE
+            AND temperature IS NOT NULL`,
+        [baseTemp, deviceUuids],
+      );
+
+      const todayPartial = Number(todayRows[0]?.today_partial ?? 0);
+      degree_days = storedTotal + todayPartial;
+    }
+
+    // Strip internal accumulator columns before sending the response
+    const { degree_days_to_date: _a, degree_days_calc_date: _b, ...cycleData } = cycle;
+    res.json({ cycle: { ...cycleData, degree_days } });
   } catch (err) {
     console.error('Error fetching cycle:', err);
     res.status(500).json({ error: 'Internal server error' });
