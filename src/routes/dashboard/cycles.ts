@@ -80,6 +80,7 @@ const closeCycleSchema = z.object({
 
 const createMonitoringSchema = z.object({
   monitored_at:    z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'monitored_at debe ser YYYY-MM-DD'),
+  plant_label:     z.string().trim().max(100).optional(),
   scores:          z.record(z.union([z.number(), z.boolean()])),
   sampling_effort: z.record(z.unknown()).optional(),
   notes:           z.string().trim().max(1000).optional(),
@@ -445,8 +446,8 @@ router.get('/cycles/:cycle_id/monitorings', requireAuth, requireOrg, async (req:
     }
 
     const { rows: monitorings } = await pool.query(
-      `SELECT id, monitored_at, week_number, days_from_transplant, scores,
-              sampling_effort, notes, created_by, created_at
+      `SELECT id, monitored_at, plant_label, week_number, days_from_transplant,
+              scores, sampling_effort, notes, created_by, created_at
          FROM cycle_monitorings
         WHERE cycle_id = $1
         ORDER BY monitored_at DESC`,
@@ -495,7 +496,7 @@ router.post('/cycles/:cycle_id/monitorings', requireAuth, requireOrg, async (req
     return;
   }
 
-  const { monitored_at, scores, sampling_effort, notes, foci = [] } = parsed.data;
+  const { monitored_at, plant_label, scores, sampling_effort, notes, foci = [] } = parsed.data;
 
   const client = await pool.connect();
   try {
@@ -533,12 +534,14 @@ router.post('/cycles/:cycle_id/monitorings', requireAuth, requireOrg, async (req
     // Insert monitoring record
     const { rows: monRows } = await client.query(
       `INSERT INTO cycle_monitorings
-         (cycle_id, monitored_at, week_number, days_from_transplant, scores, sampling_effort, notes, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         (cycle_id, monitored_at, plant_label, week_number, days_from_transplant,
+          scores, sampling_effort, notes, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING id`,
       [
         cycle_id,
         monitored_at,
+        plant_label ?? null,
         weekNumber,
         daysFromTransplant,
         JSON.stringify(scores),

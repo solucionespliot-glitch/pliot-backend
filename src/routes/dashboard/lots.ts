@@ -216,11 +216,29 @@ router.get('/lots/:lot_id', requireAuth, requireOrg, async (req: Request, res: R
       [lot_id],
     );
 
+    // Monitoring summaries — one entry per date per cycle for the lot timeline.
+    // The frontend shows a single line per date ("Monitoreo · N plantas").
+    const { rows: monitoringSummaries } = await pool.query(
+      `SELECT
+          cm.monitored_at,
+          c.id         AS cycle_id,
+          c.name       AS cycle_name,
+          c.crop_type  AS cycle_crop_type,
+          COUNT(*)     AS count
+         FROM cycle_monitorings cm
+         JOIN lot_cycles c ON c.id = cm.cycle_id
+        WHERE c.lot_id = $1
+        GROUP BY cm.monitored_at, c.id, c.name, c.crop_type
+        ORDER BY cm.monitored_at ASC`,
+      [lot_id],
+    );
+
     res.json({
       lot: {
         ...lot,
-        nodes:  nodeRows,
-        events: eventRows,
+        nodes:               nodeRows,
+        events:              eventRows,
+        monitoring_summaries: monitoringSummaries,
       },
     });
   } catch (err) {
