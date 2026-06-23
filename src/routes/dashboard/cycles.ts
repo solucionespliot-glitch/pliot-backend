@@ -58,12 +58,23 @@ function calculateStatus(
 
 // ── Validation schemas ─────────────────────────────────────────────────────────
 
+// One product row in an application event: commercial_name is required, the rest optional
+const applicationProductSchema = z.object({
+  commercial_name:   z.string().trim().min(1).max(200),
+  active_ingredient: z.string().trim().max(200).optional(),
+  dose:              z.number().positive().optional(),
+  dose_unit:         z.string().trim().max(50).optional(),
+});
+
 const createEventSchema = z.object({
   event_type:  z.enum(['sowing', 'transplant', 'application', 'harvest']),
   occurred_at: z.string().datetime(),
   notes:       z.string().trim().max(1000).optional(),
-  // For application events: { product, dose, unit }
-  data:        z.record(z.unknown()).optional(),
+  // For application events: data.products is an array of product rows.
+  // Other event types may leave data undefined.
+  data: z.object({
+    products: z.array(applicationProductSchema).optional(),
+  }).optional(),
 });
 
 const createCycleSchema = z.object({
@@ -89,6 +100,23 @@ const createMonitoringSchema = z.object({
     location_text: z.string().trim().max(500).optional(),
     notes:         z.string().trim().max(500).optional(),
   })).optional(),
+});
+
+// ── GET /dashboard/pesticide-products ─────────────────────────────────────────
+// Returns the global catalog of pesticide products for application event autocomplete.
+// This is a shared catalog (not org-scoped) so no requireOrg needed.
+router.get('/pesticide-products', requireAuth, async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, commercial_name, active_ingredient, dose_unit, default_dose, toxicological_category
+         FROM pesticide_products
+        ORDER BY commercial_name ASC`,
+    );
+    res.json({ products: rows });
+  } catch (err) {
+    console.error('Error fetching pesticide products:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 // ── GET /dashboard/crop-types ─────────────────────────────────────────────────
