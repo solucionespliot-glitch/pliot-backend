@@ -58,6 +58,14 @@ function calculateStatus(
 
 // ── Validation schemas ─────────────────────────────────────────────────────────
 
+const createEventSchema = z.object({
+  event_type:  z.enum(['sowing', 'transplant', 'application', 'harvest']),
+  occurred_at: z.string().datetime(),
+  notes:       z.string().trim().max(1000).optional(),
+  // For application events: { product, dose, unit }
+  data:        z.record(z.unknown()).optional(),
+});
+
 const createCycleSchema = z.object({
   name:                      z.string().trim().min(1).max(150),
   crop_type:                 z.string().trim().min(1).max(100),
@@ -582,6 +590,93 @@ router.post('/cycles/:cycle_id/monitorings', requireAuth, requireOrg, async (req
     res.status(500).json({ error: 'Internal server error' });
   } finally {
     client.release();
+  }
+});
+
+// ── GET /dashboard/cycles/:cycle_id/events ───────────────────────────────────
+// Returns all events belonging to a cycle, ordered chronologically.
+router.get('/cycles/:cycle_id/events', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  const { cycle_id } = req.params;
+
+  try {
+    // Verify cycle belongs to a lot of this org
+    const { rows: cycleRows } = await pool.query(
+      `SELECT c.id
+         FROM lot_cycles c
+         JOIN lots l ON l.id = c.lot_id
+        WHERE c.id = $1 AND l.organization_id = $2`,
+      [cycle_id, req.user!.organization_id],
+    );
+    if (!cycleRows[0]) {
+      res.status(404).json({ error: 'Cycle not found' });
+      return;
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id, event_type, occurred_at, notes, data, created_by, created_at
+         FROM lot_events
+        WHERE cycle_id = $1
+        ORDER BY occurred_at ASC`,
+      [cycle_id],
+    );
+    res.json({ events: rows });
+  } catch (err) {
+    console.error('Error fetching cycle events:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── POST /dashboard/cycles/:cycle_id/events ───────────────────────────────────
+// Records an event (sowing, transplant, application, harvest) within a cycle.
+// Events are stored in lot_events with cycle_id set — they belong to the cycle,
+// not the lot directly. Closed cycles do not accept new events.
+router.post('/cycles/:cycle_id/events', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  const { cycle_id } = req.params;
+
+  const parsed = createEventSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0].message });
+    return;
+  }
+
+  const { event_type, occurred_at, notes, data } = parsed.data;
+
+  try {
+    // Verify cycle belongs to this org and is still active
+    const { rows: cycleRows } = await pool.query(
+      `SELECT c.id, c.ended_at, l.id AS lot_id
+         FROM lot_cycles c
+         JOIN lots l ON l.id = c.lot_id
+        WHERE c.id = $1 AND l.organization_id = $2`,
+      [cycle_id, req.user!.organization_id],
+    );
+    if (!cycleRows[0]) {
+      res.status(404).json({ error: 'Cycle not found' });
+      return;
+    }
+    if (cycleRows[0].ended_at !== null) {
+      res.status(400).json({ error: 'Cannot add events to a closed cycle' });
+      return;
+    }
+
+    const { rows } = await pool.query(
+      `INSERT INTO lot_events (lot_id, cycle_id, event_type, occurred_at, notes, data, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id`,
+      [
+        cycleRows[0].lot_id,
+        cycle_id,
+        event_type,
+        occurred_at,
+        notes ?? null,
+        data ? JSON.stringify(data) : null,
+        req.user!.auth0_sub,
+      ],
+    );
+    res.status(201).json({ id: rows[0].id });
+  } catch (err) {
+    console.error('Error creating cycle event:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

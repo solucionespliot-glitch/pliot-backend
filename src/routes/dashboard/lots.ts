@@ -198,48 +198,29 @@ router.get('/lots/:lot_id', requireAuth, requireOrg, async (req: Request, res: R
       [lot_id],
     );
 
-    // Events (last 50, most recent first)
+    // Events — full history for the lot timeline, enriched with cycle info.
+    // Ordered chronologically (ASC) so the frontend can render oldest→newest.
     const { rows: eventRows } = await pool.query(
-      `SELECT id, event_type, occurred_at, notes, data, created_at
-         FROM lot_events
-        WHERE lot_id = $1
-        ORDER BY occurred_at DESC
-        LIMIT 50`,
+      `SELECT
+          le.id, le.event_type, le.occurred_at, le.notes, le.data,
+          le.created_at, le.cycle_id,
+          lc.name       AS cycle_name,
+          lc.crop_type  AS cycle_crop_type,
+          lc.started_at AS cycle_started_at,
+          lc.ended_at   AS cycle_ended_at
+         FROM lot_events le
+         LEFT JOIN lot_cycles lc ON lc.id = le.cycle_id
+        WHERE le.lot_id = $1
+        ORDER BY le.occurred_at ASC
+        LIMIT 200`,
       [lot_id],
     );
-
-    // Degree-day accumulator since last transplant.
-    // Formula: SUM(avg_daily_temp - base_temp) for days where avg > base_temp.
-    // Base temp: 10°C (standard for most horticultural crops).
-    const lastTransplant = eventRows.find((e) => e.event_type === 'transplant');
-    let degree_days: number | null = null;
-
-    if (lastTransplant && nodeRows.length > 0) {
-      const deviceUuids = nodeRows.map((n) => n.device_uuid);
-      const BASE_TEMP = 10;
-
-      const { rows: ddRows } = await pool.query(
-        `SELECT COALESCE(SUM(GREATEST(avg_temp - $1, 0)), 0) AS degree_days
-           FROM (
-             SELECT DATE_TRUNC('day', ts) AS day,
-                    AVG(temperature)      AS avg_temp
-               FROM telemetry_norm
-              WHERE device_id = ANY($2)
-                AND ts >= $3
-                AND temperature IS NOT NULL
-              GROUP BY DATE_TRUNC('day', ts)
-           ) daily`,
-        [BASE_TEMP, deviceUuids, lastTransplant.occurred_at],
-      );
-      degree_days = ddRows[0] ? Number(ddRows[0].degree_days) : null;
-    }
 
     res.json({
       lot: {
         ...lot,
-        nodes:       nodeRows,
-        events:      eventRows,
-        accumulators: { degree_days },
+        nodes:  nodeRows,
+        events: eventRows,
       },
     });
   } catch (err) {
