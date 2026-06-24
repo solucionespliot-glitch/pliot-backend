@@ -644,7 +644,7 @@ router.get('/cycles/:cycle_id/events', requireAuth, requireOrg, async (req: Requ
     }
 
     const { rows } = await pool.query(
-      `SELECT id, event_type, occurred_at, notes, data, created_by, created_at
+      `SELECT id, event_type, occurred_at, notes, data, days_from_transplant, created_by, created_at
          FROM lot_events
         WHERE cycle_id = $1
         ORDER BY occurred_at ASC`,
@@ -672,10 +672,16 @@ router.post('/cycles/:cycle_id/events', requireAuth, requireOrg, async (req: Req
 
   const { event_type, occurred_at, notes, data } = parsed.data;
 
+  // Reject events dated in the future
+  if (new Date(occurred_at) > new Date()) {
+    res.status(400).json({ error: 'No se pueden registrar eventos con fecha futura' });
+    return;
+  }
+
   try {
-    // Verify cycle belongs to this org and is still active
+    // Verify cycle belongs to this org and is still active; also fetch started_at for ddt
     const { rows: cycleRows } = await pool.query(
-      `SELECT c.id, c.ended_at, l.id AS lot_id
+      `SELECT c.id, c.ended_at, c.started_at, l.id AS lot_id
          FROM lot_cycles c
          JOIN lots l ON l.id = c.lot_id
         WHERE c.id = $1 AND l.organization_id = $2`,
@@ -690,9 +696,17 @@ router.post('/cycles/:cycle_id/events', requireAuth, requireOrg, async (req: Req
       return;
     }
 
+    // Calculate days from transplant: days between cycle start and event date
+    const startDate  = new Date(cycleRows[0].started_at);
+    const eventDate  = new Date(occurred_at);
+    const daysFromTransplant = Math.floor(
+      (eventDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24),
+    );
+
     const { rows } = await pool.query(
-      `INSERT INTO lot_events (lot_id, cycle_id, event_type, occurred_at, notes, data, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO lot_events
+         (lot_id, cycle_id, event_type, occurred_at, notes, data, days_from_transplant, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id`,
       [
         cycleRows[0].lot_id,
@@ -701,6 +715,7 @@ router.post('/cycles/:cycle_id/events', requireAuth, requireOrg, async (req: Req
         occurred_at,
         notes ?? null,
         data ? JSON.stringify(data) : null,
+        daysFromTransplant,
         req.user!.auth0_sub,
       ],
     );
