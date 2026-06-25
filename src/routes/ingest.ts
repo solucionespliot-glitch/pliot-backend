@@ -436,7 +436,7 @@ router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise
 
         if (!decoded) {
           // MIC failed or malformed frame — log and skip, don't alert (could be noise)
-          console.warn(`[LoRa ABP] MIC fail or parse error for DevAddr ${deviceId}`);
+          console.warn(`[LoRa ABP] MIC fail or parse error for DevAddr ${deviceId} — frame.data (first 200 chars): ${(frame.data ?? '').toString().slice(0, 200)}`);
           continue;
         }
 
