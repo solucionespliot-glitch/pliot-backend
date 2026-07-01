@@ -20,7 +20,9 @@ router.get('/', requireAuth, requireOrg, async (req: Request, res: Response): Pr
         c.override_expires_at,
         c.config_version,
         c.last_sync_at,
+        c.context,
         d.device_id,
+        d.device_type,
         COALESCE(d.legacy_device_name, d.device_id) AS device_name,
         d.site_id,
         d.zone_id

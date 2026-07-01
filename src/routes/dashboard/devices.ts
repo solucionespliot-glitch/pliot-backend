@@ -105,6 +105,7 @@ router.get('/sites/:site_id/devices', requireAuth, requireOrg, async (req: Reque
          ) tn ON TRUE
         WHERE d.organization_id = $1
           AND d.site_id = $2
+          AND d.device_type != 'gateway'
           ${zoneFilter}
         ORDER BY d.device_id ASC`,
       params,
