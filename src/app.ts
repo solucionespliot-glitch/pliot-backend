@@ -13,6 +13,7 @@ import dashboardFoggersRouter from './routes/dashboard/foggers';
 import dashboardSettingsRouter from './routes/dashboard/settings';
 import dashboardLotsRouter from './routes/dashboard/lots';
 import dashboardCyclesRouter from './routes/dashboard/cycles';
+import { requireAuth, requireOrg, requireFeature } from './middleware/auth';
 
 dotenv.config();
 
@@ -83,8 +84,8 @@ app.use('/dashboard/irrigation', dashboardIrrigationRouter);
 app.use('/dashboard', dashboardDevicesRouter);
 app.use('/dashboard/foggers', dashboardFoggersRouter);
 app.use('/dashboard/settings', dashboardSettingsRouter);
-app.use('/dashboard', dashboardLotsRouter);
-app.use('/dashboard', dashboardCyclesRouter);
+app.use('/dashboard', requireAuth, requireOrg, requireFeature('lots'), dashboardLotsRouter);
+app.use('/dashboard', requireAuth, requireOrg, requireFeature('lots'), dashboardCyclesRouter);
 
 // Bind to localhost only — nginx proxies from outside
 app.listen(Number(PORT), '127.0.0.1', () => {

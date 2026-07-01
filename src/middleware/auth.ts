@@ -100,6 +100,44 @@ export function requireOrg(req: Request, res: Response, next: NextFunction): voi
   next();
 }
 
+// ─── requireFeature ──────────────────────────────────────────────────────────
+// Gates a route behind an org-level feature flag stored in organizations.features.
+// Superusers always bypass this check.
+
+export function requireFeature(feature: string) {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    if (!req.user) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    // Superusers see everything
+    if (req.user.role === 'superuser') { next(); return; }
+
+    if (!req.user.organization_id) {
+      res.status(403).json({ error: 'Feature not available' });
+      return;
+    }
+
+    try {
+      const { rows } = await pool.query(
+        'SELECT features FROM organizations WHERE id = $1',
+        [req.user.organization_id],
+      );
+
+      if (!rows[0] || !rows[0].features[feature]) {
+        res.status(403).json({ error: 'Feature not available for your plan' });
+        return;
+      }
+
+      next();
+    } catch (err) {
+      console.error('[requireFeature] DB error:', err);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  };
+}
+
 // ─── requireRole ─────────────────────────────────────────────────────────────
 // Accepts an array of allowed roles. 403 if user role is not in the list.
 

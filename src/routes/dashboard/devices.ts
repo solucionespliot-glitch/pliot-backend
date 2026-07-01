@@ -24,11 +24,31 @@ const TELEMETRY_COLUMNS = new Set([
 ]);
 
 // ─── GET /dashboard/me ───────────────────────────────────────────────────────
-router.get('/me', requireAuth, requireOrg, (req: Request, res: Response): void => {
+// Returns current user info including org feature flags.
+// Superusers (no fixed org) get all features enabled.
+router.get('/me', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  let features: Record<string, boolean> = {};
+
+  if (req.user!.role === 'superuser' && !req.user!.organization_id) {
+    // Superuser without impersonation: grant all known features
+    features = { lots: true };
+  } else if (req.user!.organization_id) {
+    try {
+      const { rows } = await pool.query(
+        'SELECT features FROM organizations WHERE id = $1',
+        [req.user!.organization_id],
+      );
+      features = rows[0]?.features ?? {};
+    } catch (err) {
+      console.error('[/me] Error fetching org features:', err);
+    }
+  }
+
   res.json({
     auth0_sub:       req.user!.auth0_sub,
     organization_id: req.user!.organization_id,
     role:            req.user!.role,
+    features,
   });
 });
 
