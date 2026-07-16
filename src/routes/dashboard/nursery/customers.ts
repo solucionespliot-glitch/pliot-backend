@@ -93,4 +93,70 @@ router.get('/nursery/customers/:id', requireAuth, requireOrg, async (req: Reques
   }
 });
 
+// ── PATCH /dashboard/nursery/customers/:id ───────────────────────────────────
+// Updates editable fields on a customer. All fields optional (partial update).
+const patchCustomerSchema = z.object({
+  name:             z.string().trim().min(1).max(200).optional(),
+  contact_name:     z.string().trim().max(200).nullable().optional(),
+  email:            z.string().email().nullable().optional(),
+  phone:            z.string().trim().max(50).nullable().optional(),
+  tax_id_type:      z.enum(['cuit', 'cuil', 'dni', 'passport', 'other']).nullable().optional(),
+  tax_id:           z.string().trim().max(20).nullable().optional(),
+  fiscal_condition: z.string().trim().max(100).nullable().optional(),
+  billing_address:  z.string().trim().max(500).nullable().optional(),
+  delivery_address: z.string().trim().max(500).nullable().optional(),
+  notes:            z.string().trim().max(1000).nullable().optional(),
+  active:           z.boolean().optional(),
+});
+
+router.patch('/nursery/customers/:id', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  const parsed = patchCustomerSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0].message });
+    return;
+  }
+
+  const { id } = req.params;
+  const { organization_id } = req.user!;
+  const fields = parsed.data;
+
+  // Build SET clause dynamically from provided fields
+  const setClauses: string[] = ['updated_at = NOW()'];
+  const params: unknown[]    = [];
+  let   idx                  = 1;
+
+  const allowed = ['name', 'contact_name', 'email', 'phone', 'tax_id_type', 'tax_id',
+                   'fiscal_condition', 'billing_address', 'delivery_address', 'notes', 'active'] as const;
+
+  for (const key of allowed) {
+    if (key in fields) {
+      setClauses.push(`${key} = $${idx++}`);
+      params.push((fields as Record<string, unknown>)[key] ?? null);
+    }
+  }
+
+  if (setClauses.length === 1) {
+    res.status(400).json({ error: 'No fields to update' });
+    return;
+  }
+
+  params.push(id, organization_id);
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE nursery_customers
+          SET ${setClauses.join(', ')}
+        WHERE id = $${idx++} AND organization_id = $${idx}
+        RETURNING id, name, contact_name, email, phone, tax_id_type, tax_id,
+                  fiscal_condition, active, updated_at`,
+      params,
+    );
+    if (!rows[0]) { res.status(404).json({ error: 'Customer not found' }); return; }
+    res.json({ customer: rows[0] });
+  } catch (err) {
+    console.error('[PATCH /nursery/customers/:id]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 export default router;
