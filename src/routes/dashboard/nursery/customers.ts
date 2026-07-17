@@ -6,32 +6,46 @@ import { requireAuth, requireOrg } from '../../../middleware/auth';
 const router = Router();
 
 const createCustomerSchema = z.object({
-  name:             z.string().trim().min(1).max(200),
-  contact_name:     z.string().trim().max(200).optional(),
-  email:            z.string().email().optional(),
-  phone:            z.string().trim().max(50).optional(),
-  tax_id_type:      z.enum(['cuit', 'cuil', 'dni', 'passport', 'other']).optional(),
-  tax_id:           z.string().trim().max(20).optional(),
-  fiscal_condition: z.string().trim().max(100).optional(),
-  billing_address:  z.string().trim().max(500).optional(),
-  delivery_address: z.string().trim().max(500).optional(),
-  notes:            z.string().trim().max(1000).optional(),
+  name:               z.string().trim().min(1).max(200),
+  parent_customer_id: z.string().uuid().optional(),
+  contact_name:       z.string().trim().max(200).optional(),
+  email:              z.string().email().optional(),
+  phone:              z.string().trim().max(50).optional(),
+  tax_id_type:        z.enum(['cuit', 'cuil', 'dni', 'passport', 'other']).optional(),
+  tax_id:             z.string().trim().max(20).optional(),
+  fiscal_condition:   z.string().trim().max(100).optional(),
+  billing_address:    z.string().trim().max(500).optional(),
+  delivery_address:   z.string().trim().max(500).optional(),
+  notes:              z.string().trim().max(1000).optional(),
+  // When true, bypasses duplicate detection and creates the customer anyway
+  force:              z.boolean().optional(),
 });
 
 // ── GET /dashboard/nursery/customers ─────────────────────────────────────────
-// Returns all active customers for the org, ordered by name.
+// Returns all active top-level customers (producers) with their children (quintas).
+// Children are nested in a `locations` array on each parent.
 router.get('/nursery/customers', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { organization_id } = req.user!;
   try {
     const { rows } = await pool.query(
-      `SELECT id, name, contact_name, email, phone,
-              tax_id_type, tax_id, fiscal_condition, active, created_at
+      `SELECT id, name, parent_customer_id, contact_name, email, phone,
+              tax_id_type, tax_id, fiscal_condition, delivery_address, active, created_at
          FROM nursery_customers
         WHERE organization_id = $1 AND active = true
-        ORDER BY name`,
+        ORDER BY parent_customer_id NULLS FIRST, name`,
       [organization_id],
     );
-    res.json({ customers: rows });
+
+    // Build hierarchy: top-level customers with their children nested
+    const parents  = rows.filter(r => r.parent_customer_id === null);
+    const children = rows.filter(r => r.parent_customer_id !== null);
+
+    const result = parents.map(p => ({
+      ...p,
+      locations: children.filter(c => c.parent_customer_id === p.id),
+    }));
+
+    res.json({ customers: result });
   } catch (err) {
     console.error('[GET /nursery/customers]', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -39,6 +53,9 @@ router.get('/nursery/customers', requireAuth, requireOrg, async (req: Request, r
 });
 
 // ── POST /dashboard/nursery/customers ────────────────────────────────────────
+// Creates a customer or quinta (sub-customer).
+// Before inserting, checks for duplicates by name, phone, or tax_id within the org.
+// If a duplicate is found and `force` is not set, returns 409 with the existing customer.
 router.post('/nursery/customers', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const parsed = createCustomerSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -46,28 +63,67 @@ router.post('/nursery/customers', requireAuth, requireOrg, async (req: Request, 
     return;
   }
 
-  const { name, contact_name, email, phone, tax_id_type, tax_id,
-          fiscal_condition, billing_address, delivery_address, notes } = parsed.data;
+  const {
+    name, parent_customer_id, contact_name, email, phone,
+    tax_id_type, tax_id, fiscal_condition,
+    billing_address, delivery_address, notes,
+    force,
+  } = parsed.data;
   const { organization_id } = req.user!;
 
   try {
+    // ── Duplicate detection ───────────────────────────────────────────────────
+    // Only check top-level customers (quintas can share a phone with their producer)
+    if (!force && !parent_customer_id) {
+      const dupResult = await pool.query(
+        `SELECT id, name, phone, tax_id
+           FROM nursery_customers
+          WHERE organization_id = $1
+            AND active = true
+            AND parent_customer_id IS NULL
+            AND (
+              lower(trim(name)) = lower(trim($2))
+              OR ($3::text IS NOT NULL AND phone = $3)
+              OR ($4::text IS NOT NULL AND tax_id  = $4)
+            )
+          LIMIT 1`,
+        [organization_id, name, phone ?? null, tax_id ?? null],
+      );
+
+      if (dupResult.rows.length > 0) {
+        // Return conflict — frontend decides whether to show warning or force-create
+        res.status(409).json({
+          conflict:  true,
+          field:     dupResult.rows[0].name.toLowerCase() === name.toLowerCase() ? 'name' :
+                     dupResult.rows[0].phone === phone                           ? 'phone' : 'tax_id',
+          existing:  dupResult.rows[0],
+        });
+        return;
+      }
+    }
+
+    // ── Insert ────────────────────────────────────────────────────────────────
     const { rows } = await pool.query(
       `INSERT INTO nursery_customers
-         (organization_id, name, contact_name, email, phone, tax_id_type, tax_id,
-          fiscal_condition, billing_address, delivery_address, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-       RETURNING id, name, contact_name, email, phone, tax_id_type, tax_id,
-                 fiscal_condition, active, created_at`,
-      [organization_id, name,
-       contact_name     ?? null,
-       email            ?? null,
-       phone            ?? null,
-       tax_id_type      ?? null,
-       tax_id           ?? null,
-       fiscal_condition ?? null,
-       billing_address  ?? null,
-       delivery_address ?? null,
-       notes            ?? null],
+         (organization_id, name, parent_customer_id, contact_name, email, phone,
+          tax_id_type, tax_id, fiscal_condition, billing_address, delivery_address, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING id, name, parent_customer_id, contact_name, email, phone,
+                 tax_id_type, tax_id, fiscal_condition, delivery_address, active, created_at`,
+      [
+        organization_id,
+        name,
+        parent_customer_id     ?? null,
+        contact_name           ?? null,
+        email                  ?? null,
+        phone                  ?? null,
+        tax_id_type            ?? null,
+        tax_id                 ?? null,
+        fiscal_condition       ?? null,
+        billing_address        ?? null,
+        delivery_address       ?? null,
+        notes                  ?? null,
+      ],
     );
     res.status(201).json({ customer: rows[0] });
   } catch (err) {
@@ -77,6 +133,7 @@ router.post('/nursery/customers', requireAuth, requireOrg, async (req: Request, 
 });
 
 // ── GET /dashboard/nursery/customers/:id ─────────────────────────────────────
+// Returns customer detail including its children (quintas) if it's a parent.
 router.get('/nursery/customers/:id', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
   const { organization_id } = req.user!;
@@ -86,7 +143,17 @@ router.get('/nursery/customers/:id', requireAuth, requireOrg, async (req: Reques
       [id, organization_id],
     );
     if (!rows[0]) { res.status(404).json({ error: 'Customer not found' }); return; }
-    res.json({ customer: rows[0] });
+
+    // Fetch children (quintas) if this is a top-level customer
+    const { rows: locations } = await pool.query(
+      `SELECT id, name, contact_name, phone, delivery_address, active
+         FROM nursery_customers
+        WHERE parent_customer_id = $1 AND organization_id = $2 AND active = true
+        ORDER BY name`,
+      [id, organization_id],
+    );
+
+    res.json({ customer: { ...rows[0], locations } });
   } catch (err) {
     console.error('[GET /nursery/customers/:id]', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -96,17 +163,18 @@ router.get('/nursery/customers/:id', requireAuth, requireOrg, async (req: Reques
 // ── PATCH /dashboard/nursery/customers/:id ───────────────────────────────────
 // Updates editable fields on a customer. All fields optional (partial update).
 const patchCustomerSchema = z.object({
-  name:             z.string().trim().min(1).max(200).optional(),
-  contact_name:     z.string().trim().max(200).nullable().optional(),
-  email:            z.string().email().nullable().optional(),
-  phone:            z.string().trim().max(50).nullable().optional(),
-  tax_id_type:      z.enum(['cuit', 'cuil', 'dni', 'passport', 'other']).nullable().optional(),
-  tax_id:           z.string().trim().max(20).nullable().optional(),
-  fiscal_condition: z.string().trim().max(100).nullable().optional(),
-  billing_address:  z.string().trim().max(500).nullable().optional(),
-  delivery_address: z.string().trim().max(500).nullable().optional(),
-  notes:            z.string().trim().max(1000).nullable().optional(),
-  active:           z.boolean().optional(),
+  name:               z.string().trim().min(1).max(200).optional(),
+  parent_customer_id: z.string().uuid().nullable().optional(),
+  contact_name:       z.string().trim().max(200).nullable().optional(),
+  email:              z.string().email().nullable().optional(),
+  phone:              z.string().trim().max(50).nullable().optional(),
+  tax_id_type:        z.enum(['cuit', 'cuil', 'dni', 'passport', 'other']).nullable().optional(),
+  tax_id:             z.string().trim().max(20).nullable().optional(),
+  fiscal_condition:   z.string().trim().max(100).nullable().optional(),
+  billing_address:    z.string().trim().max(500).nullable().optional(),
+  delivery_address:   z.string().trim().max(500).nullable().optional(),
+  notes:              z.string().trim().max(1000).nullable().optional(),
+  active:             z.boolean().optional(),
 });
 
 router.patch('/nursery/customers/:id', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
@@ -125,8 +193,11 @@ router.patch('/nursery/customers/:id', requireAuth, requireOrg, async (req: Requ
   const params: unknown[]    = [];
   let   idx                  = 1;
 
-  const allowed = ['name', 'contact_name', 'email', 'phone', 'tax_id_type', 'tax_id',
-                   'fiscal_condition', 'billing_address', 'delivery_address', 'notes', 'active'] as const;
+  const allowed = [
+    'name', 'parent_customer_id', 'contact_name', 'email', 'phone',
+    'tax_id_type', 'tax_id', 'fiscal_condition',
+    'billing_address', 'delivery_address', 'notes', 'active',
+  ] as const;
 
   for (const key of allowed) {
     if (key in fields) {
@@ -147,8 +218,8 @@ router.patch('/nursery/customers/:id', requireAuth, requireOrg, async (req: Requ
       `UPDATE nursery_customers
           SET ${setClauses.join(', ')}
         WHERE id = $${idx++} AND organization_id = $${idx}
-        RETURNING id, name, contact_name, email, phone, tax_id_type, tax_id,
-                  fiscal_condition, active, updated_at`,
+        RETURNING id, name, parent_customer_id, contact_name, email, phone,
+                  tax_id_type, tax_id, fiscal_condition, delivery_address, active, updated_at`,
       params,
     );
     if (!rows[0]) { res.status(404).json({ error: 'Customer not found' }); return; }
