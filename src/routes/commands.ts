@@ -166,9 +166,14 @@ router.post('/:id/heartbeat', requireCommandScope, async (req: Request, res: Res
 });
 
 // ─── GET /api/v1.5/controllers/:id/vpd ───────────────────────────────────────
-// Returns the latest VPD reading across all influence nodes of this controller.
-// The firmware polls this to drive the fogger state machine when WiFi is available.
-// Response includes age_seconds so the device can decide if the reading is stale.
+// Returns one VPD value per enabled actuator, combining its influence nodes
+// according to the actuator's vpd_logic (stored in behavior_config):
+//   "any"     → MAX(vpd)  — starts if any node exceeds threshold (default)
+//   "all"     → MIN(vpd)  — starts only when all nodes exceed threshold
+//   "average" → AVG(vpd)  — starts when the average exceeds threshold
+//
+// Actuators with no influence nodes or no fresh data (>5 min) are omitted.
+// The firmware maps each entry to its relay by relay_index.
 
 router.get('/:id/vpd', requireCommandScope, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
@@ -187,44 +192,52 @@ router.get('/:id/vpd', requireCommandScope, async (req: Request, res: Response):
     return;
   }
 
-  // For each influence node get its most recent non-stale VPD reading,
-  // then return the node with the highest VPD (most conservative: act when
-  // any zone needs it). Nodes with no reading in the last 5 min are excluded —
-  // if a node fails, the remaining active nodes still drive the decision.
+  // For each enabled actuator, get the latest VPD from each influence node
+  // (within the last 5 minutes), then combine using vpd_logic.
   const { rows } = await pool.query(
-    `WITH latest_per_node AS (
-        SELECT DISTINCT ON (d.id)
-            d.device_id AS source,
-            tn.vpd,
-            tn.ts,
-            EXTRACT(EPOCH FROM (NOW() - tn.ts))::int AS age_seconds
-          FROM actuators a
-          JOIN actuator_influence_nodes ain ON ain.actuator_id = a.id
-          JOIN devices d                   ON d.id = ain.sensor_device_id
-          JOIN telemetry_norm tn           ON tn.device_id = d.id
-                                          AND tn.vpd IS NOT NULL
-         WHERE a.controller_id = $1
-           AND tn.ts > NOW() - INTERVAL '5 minutes'
-         ORDER BY d.id, tn.ts DESC
+    `WITH node_readings AS (
+        SELECT
+          a.id                                                  AS actuator_id,
+          a.relay_index,
+          COALESCE(a.behavior_config->>'vpd_logic', 'any')      AS vpd_logic,
+          tn.vpd,
+          EXTRACT(EPOCH FROM (NOW() - tn.ts))::int              AS age_seconds
+        FROM actuators a
+        JOIN actuator_influence_nodes ain ON ain.actuator_id = a.id
+        JOIN devices d                   ON d.id = ain.sensor_device_id
+        JOIN LATERAL (
+          SELECT vpd, ts
+            FROM telemetry_norm
+           WHERE device_id = d.id
+             AND vpd IS NOT NULL
+             AND ts > NOW() - INTERVAL '5 minutes'
+           ORDER BY ts DESC
+           LIMIT 1
+        ) tn ON true
+        WHERE a.controller_id = $1
+          AND a.enabled = true
      )
-     SELECT vpd, source, ts, age_seconds
-       FROM latest_per_node
-      ORDER BY vpd DESC
-      LIMIT 1`,
+     SELECT
+       relay_index,
+       vpd_logic,
+       CASE vpd_logic
+         WHEN 'all'     THEN MIN(vpd)
+         WHEN 'average' THEN ROUND(AVG(vpd)::numeric, 3)::float8
+         ELSE                MAX(vpd)
+       END                  AS vpd,
+       MIN(age_seconds)     AS age_seconds
+     FROM node_readings
+     GROUP BY relay_index, vpd_logic
+     ORDER BY relay_index ASC`,
     [ctrlRows[0].id],
   );
 
-  if (!rows[0]) {
+  if (rows.length === 0) {
     res.status(404).json({ error: 'No VPD data available from influence nodes' });
     return;
   }
 
-  res.json({
-    vpd:         rows[0].vpd,
-    source:      rows[0].source,
-    ts:          rows[0].ts,
-    age_seconds: rows[0].age_seconds,
-  });
+  res.json({ actuators: rows });
 });
 
 // GET /api/v1.5/controllers/:id/commands
