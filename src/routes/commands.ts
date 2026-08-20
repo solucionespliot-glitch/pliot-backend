@@ -54,17 +54,31 @@ router.get('/:id/snapshot', requireCommandScope, async (req: Request, res: Respo
     [ctrl.id],
   );
 
-  // Attach influence node device_ids to each actuator
+  // Attach influence nodes to each actuator, including ABP keys for LoRa nodes.
+  // The firmware uses these keys to decrypt LoRa packets locally and derive VPD
+  // without a backend round-trip. WiFi-only nodes have null dev_addr/keys.
   const actuators = await Promise.all(
     actuatorRows.map(async (act) => {
       const { rows: nodeRows } = await pool.query(
-        `SELECT d.device_id AS sensor_id
+        `SELECT d.device_id   AS sensor_id,
+                k.dev_addr,
+                k.app_s_key,
+                k.nwk_s_key
            FROM actuator_influence_nodes ain
            JOIN devices d ON d.id = ain.sensor_device_id
+           LEFT JOIN lora_abp_keys k ON k.device_id = d.id
           WHERE ain.actuator_id = $1`,
         [act.id],
       );
-      return { ...act, influence_nodes: nodeRows.map((n) => n.sensor_id) };
+      return {
+        ...act,
+        influence_nodes: nodeRows.map((n) => ({
+          sensor_id: n.sensor_id,
+          dev_addr:  n.dev_addr  ?? null,
+          app_s_key: n.app_s_key ?? null,
+          nwk_s_key: n.nwk_s_key ?? null,
+        })),
+      };
     }),
   );
 
@@ -100,8 +114,9 @@ router.get('/:id/snapshot', requireCommandScope, async (req: Request, res: Respo
 const HeartbeatSchema = z.object({
   config_version: z.number().int().nonnegative(),
   relay_states:   z.array(z.boolean()).max(8).optional(),
-  cycle_state:    z.enum(['IDLE', 'CYCLE_ON', 'CYCLE_OFF']).optional(),
-  last_vpd:       z.number().optional(),
+  // cycle_states: one entry per relay (independent mode) or repeated coordinator
+  // state for all relays (cascade mode). Replaces the old single cycle_state field.
+  cycle_states:   z.array(z.enum(['IDLE', 'CYCLE_ON', 'CYCLE_OFF'])).max(8).optional(),
   uptime_seconds: z.number().int().nonnegative().optional(),
   wifi_rssi:      z.number().int().optional(),
 });
@@ -115,7 +130,7 @@ router.post('/:id/heartbeat', requireCommandScope, async (req: Request, res: Res
     return;
   }
 
-  const { config_version, relay_states, cycle_state, last_vpd, uptime_seconds, wifi_rssi } = parsed.data;
+  const { config_version, relay_states, cycle_states, uptime_seconds, wifi_rssi } = parsed.data;
 
   const { rows } = await pool.query(
     `SELECT c.id, c.config_version, c.context
@@ -135,8 +150,7 @@ router.post('/:id/heartbeat', requireCommandScope, async (req: Request, res: Res
   const runtimeCtx = {
     ...(ctrl.context ?? {}),
     last_relay_states:   relay_states   ?? null,
-    last_cycle_state:    cycle_state    ?? null,
-    last_vpd:            last_vpd       ?? null,
+    last_cycle_states:   cycle_states   ?? null,
     last_uptime_seconds: uptime_seconds ?? null,
     last_wifi_rssi:      wifi_rssi      ?? null,
   };
