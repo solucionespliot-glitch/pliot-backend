@@ -290,99 +290,245 @@ async function requireApiKey(req: Request, res: Response, next: Function): Promi
 }
 
 // ─── POST /api/v5 ────────────────────────────────────────────────────────────
+//
+// Two paths depending on the request format:
+//
+// Path A — New firmware (device_id present):
+//   Requires X-API-Key header with 'ingest' scope.
+//   Body: { device_id: "AWN-300", t: 23.5, h: 65, ... }
+//
+// Path B — Legacy WiFi firmware (deviceName present, no device_id):
+//   Old firmware was deployed before the new backend existed. It sends data in
+//   ChirpStack webhook format to /api/v5 with no authentication (the old backend
+//   had no auth). We accept these requests without an API key — security comes
+//   from the device lookup: unknown deviceNames are rejected and logged.
+//   Body: { applicationName: "WifiNodes", deviceName: "AWN-374", objectJSON: {...}, ... }
 
-router.post('/', requireApiKey, async (req: Request, res: Response): Promise<void> => {
-  try { 
-    // 1. Validate payload
-  const parsed = IngestSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: parsed.error.issues[0].message });
-    return;
-  }
-    const body      = parsed.data as Record<string, unknown>;
-    const deviceId  = body['device_id'] as string;
+router.post('/', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const body      = req.body as Record<string, unknown>;
     const ipAddress = req.ip ?? req.socket.remoteAddress ?? 'unknown';
-   
-  // 2. Look up device
-  const { rows: deviceRows } = await pool.query(
-    `SELECT id, enabled FROM devices WHERE device_id = $1`,
-    [deviceId],
-  );
 
-  if (!deviceRows[0]) {
-    await pool.query(
-      `INSERT INTO security_alerts (attempted_device_id, endpoint, ip_address, alert_type)
-       VALUES ($1, $2, $3, 'unknown_device')`,
-      [deviceId, '/api/v5', ipAddress],
-    );
-    res.status(403).json({ error: 'Device not authorized' });
-    return;
-  }
+    // Detect legacy ChirpStack format: has deviceName but no device_id
+    const isLegacy = typeof body['deviceName'] === 'string' && typeof body['device_id'] !== 'string';
 
-  const device = deviceRows[0];
+    if (isLegacy) {
+      // ── Path B: legacy WiFi firmware (ChirpStack format, no auth) ────────────
+      const deviceId = body['deviceName'] as string;
 
-  // 3. Insert raw telemetry
-  await pool.query(
-    `INSERT INTO telemetry_raw (device_id, ts, received_at, raw_decoded, parse_status)
-     VALUES ($1, NOW(), NOW(), $2, 'ok')`,
-    [device.id, JSON.stringify(body)],
-  );
+      const { rows: deviceRows } = await pool.query(
+        `SELECT id, enabled FROM devices WHERE device_id = $1`,
+        [deviceId],
+      );
 
-  // 4. Normalize payload
-  const normFields: Record<string, unknown> = {};
-  const extras: Record<string, unknown>     = {};
+      if (!deviceRows[0]) {
+        await pool.query(
+          `INSERT INTO security_alerts (attempted_device_id, endpoint, ip_address, alert_type)
+           VALUES ($1, $2, $3, 'unknown_device')`,
+          [deviceId, '/api/v5', ipAddress],
+        );
+        res.status(403).json({ error: 'Device not authorized' });
+        return;
+      }
 
-  for (const [key, value] of Object.entries(body)) {
-    if (key === 'device_id') continue;
+      const device = deviceRows[0];
+      if (!device.enabled) {
+        res.status(403).json({ error: 'Device not authorized' });
+        return;
+      }
 
-    // Some sensors send the string "null" when a reading is unavailable.
-    // Skip those for normalized columns — inserting "null" into a numeric column fails.
-    const isNullish = value === null || value === undefined || value === 'null';
+      // Extract sensor data: prefer objectJSON.DecodeDataString, fallback to base64 data field
+      let sensorData: Record<string, unknown> = {};
+      try {
+        const decoded = JSON.parse(body['objectJSON'] as string ?? '{}');
+        if (decoded.DecodeDataString) {
+          sensorData = JSON.parse(decoded.DecodeDataString);
+        }
+      } catch { /* ignore */ }
 
-    if (FIELD_MAP[key]) {
-      if (!isNullish) normFields[FIELD_MAP[key]] = value;
-    } else if (NORM_COLUMNS.has(key)) {
-      if (!isNullish) normFields[key] = value;
-    } else {
-      extras[key] = value;
+      if (Object.keys(sensorData).length === 0) {
+        try {
+          sensorData = JSON.parse(Buffer.from(body['data'] as string ?? '', 'base64').toString('utf8'));
+        } catch { /* ignore */ }
+      }
+
+      await pool.query(
+        `INSERT INTO telemetry_raw (device_id, ts, received_at, raw_decoded, parse_status)
+         VALUES ($1, NOW(), NOW(), $2, 'ok')`,
+        [device.id, JSON.stringify(body)],
+      );
+
+      const normFields: Record<string, unknown> = {};
+      const extras: Record<string, unknown>     = {};
+
+      for (const [key, value] of Object.entries(sensorData)) {
+        const isNullish = value === null || value === undefined || value === 'null';
+        if (FIELD_MAP[key]) {
+          if (!isNullish) normFields[FIELD_MAP[key]] = value;
+        } else if (NORM_COLUMNS.has(key)) {
+          if (!isNullish) normFields[key] = value;
+        } else {
+          extras[key] = value;
+        }
+      }
+
+      if (Object.keys(extras).length > 0) normFields['extras'] = extras;
+
+      updateSensorCapabilities(device.id, normFields);
+
+      const normCols: string[]    = ['device_id', 'ts'];
+      const normParams: unknown[] = [device.id];
+
+      for (const [col, val] of Object.entries(normFields)) {
+        normCols.push(col);
+        normParams.push(col === 'extras' ? JSON.stringify(val) : val);
+      }
+
+      const normColStr = normCols.join(', ');
+      let paramIdx = 1;
+      const normValStr = normCols.map((c) => {
+        if (c === 'ts') return 'NOW()';
+        return `$${paramIdx++}`;
+      }).join(', ');
+
+      await pool.query(
+        `INSERT INTO telemetry_norm (${normColStr}) VALUES (${normValStr})`,
+        normParams,
+      );
+
+      await pool.query(
+        `UPDATE devices SET last_seen_at = NOW() WHERE id = $1`,
+        [device.id],
+      );
+
+      res.json({ ok: true });
+      return;
     }
-  }
 
-  if (Object.keys(extras).length > 0) {
-    normFields['extras'] = extras;
-  }
+    // ── Path A: new firmware (device_id present), requires API key ─────────────
+    const apiKeyHeader = req.headers['x-api-key'] as string | undefined;
+    if (!apiKeyHeader || !apiKeyHeader.includes(':')) {
+      res.status(401).json({ error: 'Missing or malformed X-API-Key header (expected key_id:raw_key)' });
+      return;
+    }
 
-  // 5. Record which sensor columns this device reported (fire-and-forget)
-  updateSensorCapabilities(device.id, normFields);
+    const colonIdx = apiKeyHeader.indexOf(':');
+    const keyId    = apiKeyHeader.slice(0, colonIdx);
+    const rawKey   = apiKeyHeader.slice(colonIdx + 1);
 
-  // 6. Build and execute dynamic INSERT into telemetry_norm
-  const normCols: string[]    = ['device_id', 'ts'];
-  const normParams: unknown[] = [device.id];
+    const { rows: keyRows } = await pool.query(
+      `SELECT key_hash, scopes, enabled, expires_at FROM api_keys WHERE key_id = $1`,
+      [keyId],
+    );
 
-  for (const [col, val] of Object.entries(normFields)) {
-    normCols.push(col);
-    normParams.push(col === 'extras' ? JSON.stringify(val) : val);
-  }
+    const apiKey = keyRows[0];
+    if (!apiKey || !apiKey.enabled || (apiKey.expires_at && new Date(apiKey.expires_at) < new Date())) {
+      res.status(401).json({ error: 'Invalid or expired API key' });
+      return;
+    }
 
-  const normColStr = normCols.join(', ');
-  let paramIdx = 1;
-  const normValStr = normCols.map((c) => {
-    if (c === 'ts') return 'NOW()';
-    return `$${paramIdx++}`;
+    const valid = await bcrypt.compare(rawKey, apiKey.key_hash);
+    if (!valid) {
+      res.status(401).json({ error: 'Invalid API key' });
+      return;
+    }
+
+    const scopes: string[] = Array.isArray(apiKey.scopes) ? apiKey.scopes : [];
+    if (!scopes.includes('ingest')) {
+      res.status(403).json({ error: 'API key does not have ingest scope' });
+      return;
+    }
+
+    pool.query('UPDATE api_keys SET last_used_at = NOW() WHERE key_id = $1', [keyId]).catch(() => {});
+
+    // 1. Validate payload
+    const parsed = IngestSchema.safeParse(body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0].message });
+      return;
+    }
+
+    const validBody = parsed.data as Record<string, unknown>;
+    const deviceId  = validBody['device_id'] as string;
+
+    // 2. Look up device
+    const { rows: deviceRows } = await pool.query(
+      `SELECT id, enabled FROM devices WHERE device_id = $1`,
+      [deviceId],
+    );
+
+    if (!deviceRows[0]) {
+      await pool.query(
+        `INSERT INTO security_alerts (attempted_device_id, endpoint, ip_address, alert_type)
+         VALUES ($1, $2, $3, 'unknown_device')`,
+        [deviceId, '/api/v5', ipAddress],
+      );
+      res.status(403).json({ error: 'Device not authorized' });
+      return;
+    }
+
+    const device = deviceRows[0];
+
+    // 3. Insert raw telemetry
+    await pool.query(
+      `INSERT INTO telemetry_raw (device_id, ts, received_at, raw_decoded, parse_status)
+       VALUES ($1, NOW(), NOW(), $2, 'ok')`,
+      [device.id, JSON.stringify(validBody)],
+    );
+
+    // 4. Normalize payload
+    const normFields: Record<string, unknown> = {};
+    const extras: Record<string, unknown>     = {};
+
+    for (const [key, value] of Object.entries(validBody)) {
+      if (key === 'device_id') continue;
+
+      // Some sensors send the string "null" when a reading is unavailable.
+      // Skip those for normalized columns — inserting "null" into a numeric column fails.
+      const isNullish = value === null || value === undefined || value === 'null';
+
+      if (FIELD_MAP[key]) {
+        if (!isNullish) normFields[FIELD_MAP[key]] = value;
+      } else if (NORM_COLUMNS.has(key)) {
+        if (!isNullish) normFields[key] = value;
+      } else {
+        extras[key] = value;
+      }
+    }
+
+    if (Object.keys(extras).length > 0) normFields['extras'] = extras;
+
+    // 5. Record which sensor columns this device reported (fire-and-forget)
+    updateSensorCapabilities(device.id, normFields);
+
+    // 6. Build and execute dynamic INSERT into telemetry_norm
+    const normCols: string[]    = ['device_id', 'ts'];
+    const normParams: unknown[] = [device.id];
+
+    for (const [col, val] of Object.entries(normFields)) {
+      normCols.push(col);
+      normParams.push(col === 'extras' ? JSON.stringify(val) : val);
+    }
+
+    const normColStr = normCols.join(', ');
+    let paramIdx = 1;
+    const normValStr = normCols.map((c) => {
+      if (c === 'ts') return 'NOW()';
+      return `$${paramIdx++}`;
     }).join(', ');
 
-  await pool.query(
-    `INSERT INTO telemetry_norm (${normColStr}) VALUES (${normValStr})`,
-    normParams,
-  );
+    await pool.query(
+      `INSERT INTO telemetry_norm (${normColStr}) VALUES (${normValStr})`,
+      normParams,
+    );
 
-  // 6. Update last_seen_at
-  await pool.query(
-    `UPDATE devices SET last_seen_at = NOW() WHERE id = $1`,
-    [device.id],
-  );
+    // 7. Update last_seen_at
+    await pool.query(
+      `UPDATE devices SET last_seen_at = NOW() WHERE id = $1`,
+      [device.id],
+    );
 
-  res.json({ ok: true });
+    res.json({ ok: true });
   } catch (err) {
     console.error('Ingest error:', err);
     res.status(500).json({ error: 'Internal server error' });
