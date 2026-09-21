@@ -70,7 +70,11 @@ const ingestLimiter = rateLimit({
   message: { error: 'Ingestion rate limit exceeded.' },
 });
 
-app.use(generalLimiter);
+// Apply general limiter to all routes except /api/v5 (which has its own ingestLimiter)
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/v5')) return next();
+  return generalLimiter(req, res, next);
+});
 app.use('/api/v5', ingestLimiter);
 
 // Body parser with 50kb limit
