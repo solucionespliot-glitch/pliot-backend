@@ -703,10 +703,116 @@ router.get('/foggers', (_req: Request, res: Response) => {
   res.json({ sync_endpoint: '/api/v1.5/controllers/:id/snapshot' });
 });
 
-// ─── GET /api/v5/controllers ──────────────────────────────────────────────────
+// ─── GET /api/v5/controllers and /api/v5/controller ──────────────────────────
+// Legacy firmware (ESP32 AWN nodes) hits /api/v5/controller (singular) as a
+// liveness/config check before posting telemetry. If it gets 404 it stays in a
+// retry loop and never sends data. Return 200 so the node proceeds to POST.
 
 router.get('/controllers', (_req: Request, res: Response) => {
   res.json({ sync_endpoint: '/api/v1.5/controllers/:id/snapshot' });
+});
+
+router.get('/controller', (_req: Request, res: Response) => {
+  res.json({ sync_endpoint: '/api/v1.5/controllers/:id/snapshot' });
+});
+
+// ─── POST /api/v5/new ────────────────────────────────────────────────────────
+// Legacy endpoint used by ESP8266 nodes. Body is ChirpStack format where sensor
+// data is base64-encoded in the `data` field (no objectJSON). Processed via the
+// same legacy path as POST /api/v5 with deviceName.
+
+router.post('/new', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const body      = req.body as Record<string, unknown>;
+    const deviceId  = body['deviceName'] as string | undefined;
+    const ipAddress = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+
+    if (!deviceId) {
+      res.status(400).json({ error: 'Missing deviceName' });
+      return;
+    }
+
+    const { rows: deviceRows } = await pool.query(
+      `SELECT id, enabled FROM devices WHERE device_id = $1`,
+      [deviceId],
+    );
+
+    if (!deviceRows[0]) {
+      await pool.query(
+        `INSERT INTO security_alerts (attempted_device_id, endpoint, ip_address, alert_type)
+         VALUES ($1, $2, $3, 'unknown_device')`,
+        [deviceId, '/api/v5/new', ipAddress],
+      );
+      res.status(403).json({ error: 'Device not authorized' });
+      return;
+    }
+
+    const device = deviceRows[0];
+    if (!device.enabled) {
+      res.status(403).json({ error: 'Device not authorized' });
+      return;
+    }
+
+    // Decode sensor data from base64 data field
+    let sensorData: Record<string, unknown> = {};
+    try {
+      sensorData = JSON.parse(Buffer.from(body['data'] as string ?? '', 'base64').toString('utf8'));
+    } catch { /* ignore malformed payloads */ }
+
+    await pool.query(
+      `INSERT INTO telemetry_raw (device_id, ts, received_at, raw_decoded, parse_status)
+       VALUES ($1, NOW(), NOW(), $2, 'ok')`,
+      [device.id, JSON.stringify(body)],
+    );
+
+    const normFields: Record<string, unknown> = {};
+    const extras: Record<string, unknown>     = {};
+
+    for (const [key, value] of Object.entries(sensorData)) {
+      const isNullish = value === null || value === undefined || value === 'null';
+      if (FIELD_MAP[key]) {
+        if (!isNullish) normFields[FIELD_MAP[key]] = value;
+      } else if (NORM_COLUMNS.has(key)) {
+        if (!isNullish) normFields[key] = value;
+      } else {
+        extras[key] = value;
+      }
+    }
+
+    if (Object.keys(extras).length > 0) normFields['extras'] = extras;
+
+    updateSensorCapabilities(device.id, normFields);
+
+    const normCols: string[]    = ['device_id', 'ts'];
+    const normParams: unknown[] = [device.id];
+
+    for (const [col, val] of Object.entries(normFields)) {
+      normCols.push(col);
+      normParams.push(col === 'extras' ? JSON.stringify(val) : val);
+    }
+
+    const normColStr = normCols.join(', ');
+    let paramIdx = 1;
+    const normValStr = normCols.map((c) => {
+      if (c === 'ts') return 'NOW()';
+      return `$${paramIdx++}`;
+    }).join(', ');
+
+    await pool.query(
+      `INSERT INTO telemetry_norm (${normColStr}) VALUES (${normValStr})`,
+      normParams,
+    );
+
+    await pool.query(
+      `UPDATE devices SET last_seen_at = NOW() WHERE id = $1`,
+      [device.id],
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Ingest /new error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 export default router;
