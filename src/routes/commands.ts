@@ -10,8 +10,9 @@ const requireCommandScope = requireApiKeyScope('command');
 // ─── GET /api/v1.5/controllers/:id/snapshot ──────────────────────────────────
 // Full config snapshot for a controller identified by device_id.
 // Called by the device at boot and after receiving a requestSync command.
-// Returns controller settings, all fogger actuators with behavior_config,
-// and the influence nodes (sensor devices) for each actuator.
+// Returns controller settings, all enabled actuators with behavior_type +
+// behavior_config, influence nodes per actuator, and the site's UTC offset
+// so the firmware can convert NTP time to local time for schedule/irrigation.
 
 router.get('/:id/snapshot', requireCommandScope, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
@@ -24,9 +25,15 @@ router.get('/:id/snapshot', requireCommandScope, async (req: Request, res: Respo
         c.heartbeat_interval_seconds,
         c.override_mode,
         c.override_expires_at,
-        c.context
+        c.context,
+        -- UTC offset in minutes derived from the site's IANA timezone.
+        -- The firmware uses this to convert NTP (UTC) time to local time
+        -- for schedule and irrigation control logic.
+        EXTRACT(EPOCH FROM (TIMEZONE(s.timezone, NOW()) - NOW()))::int / 60
+          AS utc_offset_minutes
        FROM controllers c
-       JOIN devices d ON d.id = c.device_id
+       JOIN devices d ON d.id  = c.device_id
+       JOIN sites   s ON s.id  = d.site_id
       WHERE d.device_id = $1`,
     [id],
   );
@@ -38,6 +45,8 @@ router.get('/:id/snapshot', requireCommandScope, async (req: Request, res: Respo
 
   const ctrl = ctrlRows[0];
 
+  // Return all enabled actuators regardless of actuator_type.
+  // behavior_type is the single source of truth for control logic.
   const { rows: actuatorRows } = await pool.query(
     `SELECT
         a.id,
@@ -49,14 +58,15 @@ router.get('/:id/snapshot', requireCommandScope, async (req: Request, res: Respo
         a.default_safe_state
        FROM actuators a
       WHERE a.controller_id = $1
-        AND a.actuator_type = 'fogger'
+        AND a.enabled = true
       ORDER BY a.relay_index ASC`,
     [ctrl.id],
   );
 
-  // Attach influence nodes to each actuator, including ABP keys for LoRa nodes.
-  // The firmware uses these keys to decrypt LoRa packets locally and derive VPD
-  // without a backend round-trip. WiFi-only nodes have null dev_addr/keys.
+  // Attach influence nodes to each actuator.
+  // ABP keys are included for LoRa nodes (used by gateway-mode firmware to
+  // decrypt packets locally). WiFi-only nodes have null dev_addr/keys — the
+  // firmware fetches their readings via /readings instead.
   const actuators = await Promise.all(
     actuatorRows.map(async (act) => {
       const { rows: nodeRows } = await pool.query(
@@ -100,6 +110,7 @@ router.get('/:id/snapshot', requireCommandScope, async (req: Request, res: Respo
       heartbeat_interval_seconds: ctrl.heartbeat_interval_seconds,
       override_mode:              ctrl.override_mode,
       override_expires_at:        ctrl.override_expires_at,
+      utc_offset_minutes:         ctrl.utc_offset_minutes,
       context:                    ctrl.context ?? {},
     },
     actuators,
@@ -179,17 +190,21 @@ router.post('/:id/heartbeat', requireCommandScope, async (req: Request, res: Res
   res.json({ ok: true, has_pending_commands: cmdRows.length > 0 });
 });
 
-// ─── GET /api/v1.5/controllers/:id/vpd ───────────────────────────────────────
-// Returns one VPD value per enabled actuator, combining its influence nodes
-// according to the actuator's vpd_logic (stored in behavior_config):
-//   "any"     → MAX(vpd)  — starts if any node exceeds threshold (default)
-//   "all"     → MIN(vpd)  — starts only when all nodes exceed threshold
-//   "average" → AVG(vpd)  — starts when the average exceeds threshold
+// ─── GET /api/v1.5/controllers/:id/readings ──────────────────────────────────
+// Returns the latest sensor readings per actuator, combining influence nodes
+// according to the actuator's vpd_logic (stored in behavior_config).
+// Used by sensor-dependent behavior types: vpd, temperature.
 //
-// Actuators with no influence nodes or no fresh data (>5 min) are omitted.
+// vpd_logic (applies to both vpd and temperature aggregation):
+//   "any"     → MAX — triggers if any node exceeds threshold
+//   "all"     → MIN — triggers only when all nodes exceed threshold
+//   "average" → AVG — triggers when the average exceeds threshold
+//
+// Only actuators with at least one influence node with fresh data (<15 min)
+// are included. The firmware treats a missing actuator entry as stale.
 // The firmware maps each entry to its relay by relay_index.
 
-router.get('/:id/vpd', requireCommandScope, async (req: Request, res: Response): Promise<void> => {
+router.get('/:id/readings', requireCommandScope, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
 
   // Resolve controller UUID from device_id string
@@ -206,8 +221,9 @@ router.get('/:id/vpd', requireCommandScope, async (req: Request, res: Response):
     return;
   }
 
-  // For each enabled actuator, get the latest VPD from each influence node
-  // (within the last 5 minutes), then combine using vpd_logic.
+  // For each enabled actuator, get the latest vpd and temperature from each
+  // influence node (within the last 15 minutes), then combine using vpd_logic.
+  // 15 min window = allows missing 2 consecutive sends at the 7-min node interval.
   const { rows } = await pool.query(
     `WITH node_readings AS (
         SELECT
@@ -215,16 +231,16 @@ router.get('/:id/vpd', requireCommandScope, async (req: Request, res: Response):
           a.relay_index,
           COALESCE(a.behavior_config->>'vpd_logic', 'any')      AS vpd_logic,
           tn.vpd,
+          tn.temperature,
           EXTRACT(EPOCH FROM (NOW() - tn.ts))::int              AS age_seconds
         FROM actuators a
         JOIN actuator_influence_nodes ain ON ain.actuator_id = a.id
         JOIN devices d                   ON d.id = ain.sensor_device_id
         JOIN LATERAL (
-          SELECT vpd, ts
+          SELECT vpd, temperature, ts
             FROM telemetry_norm
            WHERE device_id = d.id
-             AND vpd IS NOT NULL
-             AND ts > NOW() - INTERVAL '5 minutes'
+             AND ts > NOW() - INTERVAL '15 minutes'
            ORDER BY ts DESC
            LIMIT 1
         ) tn ON true
@@ -234,23 +250,27 @@ router.get('/:id/vpd', requireCommandScope, async (req: Request, res: Response):
      SELECT
        relay_index,
        vpd_logic,
+       -- Aggregate vpd according to vpd_logic; null if no node has vpd data
        CASE vpd_logic
          WHEN 'all'     THEN MIN(vpd)
          WHEN 'average' THEN ROUND(AVG(vpd)::numeric, 3)::float8
          ELSE                MAX(vpd)
-       END                  AS vpd,
-       MIN(age_seconds)     AS age_seconds
+       END                                      AS vpd,
+       -- Aggregate temperature with the same logic
+       CASE vpd_logic
+         WHEN 'all'     THEN MIN(temperature)
+         WHEN 'average' THEN ROUND(AVG(temperature)::numeric, 2)::float8
+         ELSE                MAX(temperature)
+       END                                      AS temperature,
+       MIN(age_seconds)                         AS age_seconds
      FROM node_readings
      GROUP BY relay_index, vpd_logic
      ORDER BY relay_index ASC`,
     [ctrlRows[0].id],
   );
 
-  if (rows.length === 0) {
-    res.status(404).json({ error: 'No VPD data available from influence nodes' });
-    return;
-  }
-
+  // Return empty list (not 404) so the firmware can distinguish
+  // "no influence nodes configured" from a network/server error.
   res.json({ actuators: rows });
 });
 

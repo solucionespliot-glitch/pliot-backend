@@ -85,8 +85,15 @@ router.patch(
 // Merges with existing context — does not overwrite unrelated fields.
 
 const ControllerContextSchema = z.object({
-  relay_mode:       z.enum(['cascade', 'independent']).optional(),
-  cascade_delay_ms: z.number().int().min(0).max(5000).optional(),
+  relay_mode:           z.enum(['cascade', 'independent']).optional(),
+  cascade_delay_ms:     z.number().int().min(0).max(5000).optional(),
+  // Cascade mode shared cycle timing — set by producer role from frontend.
+  // on_seconds: how long all relays stay ON per cycle (default 3s)
+  // off_seconds: rest period between cycles (default 60s)
+  // min_interval_seconds: minimum time from cycle end before next start (default 300s)
+  on_seconds:           z.number().int().min(1).max(3600).optional(),
+  off_seconds:          z.number().int().min(1).max(3600).optional(),
+  min_interval_seconds: z.number().int().min(0).optional(),
 });
 
 router.patch(
@@ -176,23 +183,61 @@ router.get(
 );
 
 // ─── PUT /dashboard/controllers/:id/actuators/:actuator_id ───────────────────
-// Updates behavior_config fields for one actuator (thresholds, schedule,
-// vpd_logic). Merges into existing config — fields not sent are preserved.
+// Updates behavior_type and/or behavior_config for one actuator.
+// When behavior_type is provided, behavior_config is replaced entirely so the
+// config always matches the selected type. When only behavior_config is
+// provided, it is merged into the existing config (partial update).
 // Bumps config_version so the device fetches a new snapshot on next heartbeat.
 // Requires producer role or above.
 
-const ActuatorConfigSchema = z.object({
-  vpd_logic:            z.enum(['any', 'all', 'average']).optional(),
-  threshold_on:         z.number().min(0).max(5).optional(),
-  threshold_off:        z.number().min(0).max(5).optional(),
-  on_seconds:           z.number().int().min(1).max(3600).optional(),
-  off_seconds:          z.number().int().min(1).max(3600).optional(),
-  min_interval_seconds: z.number().int().min(0).optional(),
-  schedule: z.object({
-    from: z.string().regex(/^\d{2}:\d{2}$/, 'Expected HH:MM'),
-    to:   z.string().regex(/^\d{2}:\d{2}$/, 'Expected HH:MM'),
-  }).optional(),
+const TimeHHMM = z.string().regex(/^\d{2}:\d{2}$/, 'Expected HH:MM');
+
+// Per-type behavior_config schemas — validated depending on behavior_type.
+const VpdConfigSchema = z.object({
+  vpd_threshold:        z.number().min(0).max(5),
+  on_duration_seconds:  z.number().int().min(1).max(3600),
+  off_duration_seconds: z.number().int().min(1).max(3600),
+  vpd_logic:            z.enum(['any', 'all', 'average']).default('any'),
+  hysteresis:           z.number().min(0).max(2).default(0.1),
+  stale_timeout_minutes: z.number().int().min(1).max(60).default(15),
 });
+
+const ScheduleWindowSchema = z.object({
+  on_time:  TimeHHMM,
+  off_time: TimeHHMM,
+});
+
+const ScheduleConfigSchema = z.object({
+  days:    z.array(z.number().int().min(1).max(7)).min(1).max(7),
+  windows: z.array(ScheduleWindowSchema).min(1).max(10),
+});
+
+const IrrigationEventSchema = z.object({
+  time:               TimeHHMM,
+  duration_minutes:   z.number().int().min(1).max(1440),
+});
+
+const IrrigationConfigSchema = z.object({
+  days:   z.array(z.number().int().min(1).max(7)).min(1).max(7),
+  events: z.array(IrrigationEventSchema).min(1).max(20),
+});
+
+const TemperatureConfigSchema = z.object({
+  mode:                  z.enum(['heat', 'cool']),
+  min_temp:              z.number().min(-20).max(60),
+  max_temp:              z.number().min(-20).max(60),
+  hysteresis:            z.number().min(0).max(10).default(0.5),
+  stale_timeout_minutes: z.number().int().min(1).max(60).default(15),
+});
+
+// Top-level schema: accepts behavior_type + matching config, or partial merge.
+const ActuatorUpdateSchema = z.discriminatedUnion('behavior_type', [
+  z.object({ behavior_type: z.literal('vpd'),         behavior_config: VpdConfigSchema }),
+  z.object({ behavior_type: z.literal('schedule'),    behavior_config: ScheduleConfigSchema }),
+  z.object({ behavior_type: z.literal('irrigation'),  behavior_config: IrrigationConfigSchema }),
+  z.object({ behavior_type: z.literal('temperature'), behavior_config: TemperatureConfigSchema }),
+  z.object({ behavior_type: z.literal('manual'),      behavior_config: z.object({}).optional() }),
+]);
 
 router.put(
   '/:id/actuators/:actuator_id',
@@ -200,7 +245,7 @@ router.put(
   requireOrg,
   requireRole(['producer', 'distributor', 'superuser']),
   async (req: Request, res: Response): Promise<void> => {
-    const parsed = ActuatorConfigSchema.safeParse(req.body);
+    const parsed = ActuatorUpdateSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: parsed.error.issues[0].message });
       return;
@@ -217,15 +262,19 @@ router.put(
       return;
     }
 
-    // Merge new fields into existing behavior_config without overwriting unrelated keys
+    const { behavior_type, behavior_config } = parsed.data;
+
+    // Replace behavior_type and behavior_config atomically.
+    // Full replacement (not merge) ensures the config always matches the type.
     const { rows } = await pool.query(
       `UPDATE actuators
-          SET behavior_config = COALESCE(behavior_config, '{}'::jsonb) || $1::jsonb,
+          SET behavior_type   = $1,
+              behavior_config = $2::jsonb,
               updated_at      = NOW()
-        WHERE id            = $2
-          AND controller_id = $3
-        RETURNING id, relay_index, label, behavior_config`,
-      [JSON.stringify(parsed.data), req.params.actuator_id, ctrlRows[0].id],
+        WHERE id            = $3
+          AND controller_id = $4
+        RETURNING id, relay_index, label, behavior_type, behavior_config`,
+      [behavior_type, JSON.stringify(behavior_config ?? {}), req.params.actuator_id, ctrlRows[0].id],
     );
     if (!rows[0]) {
       res.status(404).json({ error: 'Actuator not found' });
@@ -334,6 +383,57 @@ router.put(
     }
 
     res.json({ ok: true, node_ids });
+  },
+);
+
+// ─── POST /dashboard/controllers/:id/commands ────────────────────────────────
+// Issues a command to a controller. Currently supports:
+//   pulseRelay — turns a relay ON for a fixed duration (manual irrigation/fog)
+// The device picks up the command on next /commands poll or heartbeat trigger.
+// Requires operator role or above.
+
+const PulseRelaySchema = z.object({
+  command_type:      z.literal('pulseRelay'),
+  relay_index:       z.number().int().min(0).max(7),
+  duration_minutes:  z.number().int().min(1).max(120),
+});
+
+const CommandSchema = PulseRelaySchema; // extend with z.union([...]) as new types are added
+
+router.post(
+  '/:id/commands',
+  requireAuth,
+  requireOrg,
+  requireRole(['producer', 'operator', 'superuser']),
+  async (req: Request, res: Response): Promise<void> => {
+    const parsed = CommandSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0].message });
+      return;
+    }
+
+    // Verify controller belongs to the requesting org
+    const { rows: ctrlRows } = await pool.query(
+      `SELECT c.id FROM controllers c
+         JOIN devices d ON d.id = c.device_id
+        WHERE c.id = $1 AND d.organization_id = $2`,
+      [req.params.id, req.user!.organization_id],
+    );
+    if (!ctrlRows[0]) {
+      res.status(404).json({ error: 'Controller not found' });
+      return;
+    }
+
+    const { command_type, ...payload } = parsed.data;
+
+    const { rows } = await pool.query(
+      `INSERT INTO commands (target_controller_id, command_type, payload, state)
+       VALUES ($1, $2, $3::jsonb, 'PENDING')
+       RETURNING cmd_id, command_type, payload, state, issued_at`,
+      [ctrlRows[0].id, command_type, JSON.stringify(payload)],
+    );
+
+    res.status(201).json({ ok: true, command: rows[0] });
   },
 );
 
