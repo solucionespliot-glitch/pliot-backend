@@ -578,11 +578,23 @@ router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise
       if (abpRows[0]) {
         // Path A: raw ABP frame — decrypt and extract sensor data
         const abpKey = abpRows[0];
+
+        // Check frame length before attempting decryption.
+        // A LoRaWAN uplink with application payload needs at least 14 bytes:
+        // MHDR(1) + DevAddr(4) + FCtrl(1) + FCnt(2) + FPort(1) + payload(>=1) + MIC(4).
+        // Shorter frames are MAC-only uplinks (e.g. empty confirmations, link-check
+        // requests) sent automatically by the node stack — skip silently.
+        const rawFrameBytes = Buffer.from((frame.data ?? '').toString(), 'base64');
+        if (rawFrameBytes.length < 14) {
+          continue;
+        }
+
         const decoded = decodeAbpFrame(frame.data ?? '', abpKey.app_s_key, abpKey.nwk_s_key);
 
         if (!decoded) {
-          // MIC failed or malformed frame — log and skip, don't alert (could be noise)
-          console.warn(`[LoRa ABP] MIC fail or parse error for DevAddr ${deviceId} — frame.data (first 200 chars): ${(frame.data ?? '').toString().slice(0, 200)}`);
+          // MIC failed or payload could not be decrypted/parsed.
+          // Most likely cause: keys in lora_abp_keys don't match the node firmware.
+          console.warn(`[LoRa ABP] MIC fail or decrypt error for DevAddr ${deviceId} — frame ${rawFrameBytes.length}B, data (first 200 chars): ${(frame.data ?? '').toString().slice(0, 200)}`);
           continue;
         }
 
