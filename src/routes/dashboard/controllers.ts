@@ -318,6 +318,54 @@ router.put(
   },
 );
 
+// ─── PATCH /dashboard/controllers/:id/actuators/:actuator_id ─────────────────
+// Updates only the label of an actuator. Does not bump config_version because
+// the label is a UI-only field — the firmware does not use it.
+// Requires producer role or above.
+
+const ActuatorLabelSchema = z.object({
+  label: z.string().min(1).max(100),
+});
+
+router.patch(
+  '/:id/actuators/:actuator_id',
+  requireAuth,
+  requireOrg,
+  requireRole(['producer', 'distributor', 'superuser']),
+  async (req: Request, res: Response): Promise<void> => {
+    const parsed = ActuatorLabelSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0].message });
+      return;
+    }
+
+    const { rows: ctrlRows } = await pool.query(
+      `SELECT c.id, d.site_id FROM controllers c
+         JOIN devices d ON d.id = c.device_id
+        WHERE c.id = $1 AND d.organization_id = $2`,
+      [req.params.id, req.user!.organization_id],
+    );
+    if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
+      res.status(404).json({ error: 'Controller not found' });
+      return;
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE actuators
+          SET label = $1, updated_at = NOW()
+        WHERE id = $2 AND controller_id = $3
+        RETURNING id, label`,
+      [parsed.data.label, req.params.actuator_id, ctrlRows[0].id],
+    );
+    if (!rows[0]) {
+      res.status(404).json({ error: 'Actuator not found' });
+      return;
+    }
+
+    res.json({ ok: true, actuator: rows[0] });
+  },
+);
+
 // ─── PUT /dashboard/controllers/:id/actuators/:actuator_id/nodes ─────────────
 // Replaces the set of influence nodes for one actuator.
 // Validates that all node UUIDs belong to the same org.
