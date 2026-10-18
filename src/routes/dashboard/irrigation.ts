@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { pool } from '../../db';
-import { requireAuth, requireOrg, requireRole } from '../../middleware/auth';
+import { requireAuth, requireOrg, requireRole, userHasSiteAccess, siteAccessFilter } from '../../middleware/auth';
 
 const router = Router();
 
@@ -9,6 +9,10 @@ const router = Router();
 // Active turns with ETc accumulated, next estimated irrigation, active Kc stage, actuators
 
 router.get('/turns', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  const sf = siteAccessFilter(req.user!.site_ids, 'd.site_id', 2);
+  const listParams: unknown[] = [req.user!.organization_id];
+  if (sf.param) listParams.push(sf.param);
+
   const { rows } = await pool.query(
     `SELECT
         it.id,
@@ -77,8 +81,9 @@ router.get('/turns', requireAuth, requireOrg, async (req: Request, res: Response
        JOIN devices d      ON d.id = c.device_id
       WHERE d.organization_id = $1
         AND it.status NOT IN ('finished')
+        ${sf.clause}
       ORDER BY it.created_at DESC`,
-    [req.user!.organization_id],
+    listParams,
   );
 
   res.json({ turns: rows });
@@ -90,9 +95,9 @@ router.get('/turns', requireAuth, requireOrg, async (req: Request, res: Response
 router.get('/turns/:turn_id/history', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { turn_id } = req.params;
 
-  // Verify org ownership
+  // Verify org ownership and site access
   const { rows: ownerRows } = await pool.query(
-    `SELECT it.id
+    `SELECT it.id, d.site_id
        FROM irrigation_turns it
        JOIN controllers c ON c.id = it.controller_id
        JOIN devices d     ON d.id = c.device_id
@@ -100,7 +105,7 @@ router.get('/turns/:turn_id/history', requireAuth, requireOrg, async (req: Reque
     [turn_id, req.user!.organization_id],
   );
 
-  if (!ownerRows[0]) {
+  if (!ownerRows[0] || !userHasSiteAccess(req.user!.site_ids, ownerRows[0].site_id)) {
     res.status(404).json({ error: 'Irrigation turn not found' });
     return;
   }
@@ -169,15 +174,15 @@ router.post(
 
     const { name, controller_id, irrigation_profile_id, sowing_date, crop, producer_adjustment_percent } = parsed.data;
 
-    // Ensure controller belongs to this org
+    // Ensure controller belongs to this org and user has site access
     const { rows: ctrlRows } = await pool.query(
-      `SELECT c.id FROM controllers c
+      `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
         WHERE c.id = $1 AND d.organization_id = $2`,
       [controller_id, req.user!.organization_id],
     );
 
-    if (!ctrlRows[0]) {
+    if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
       res.status(404).json({ error: 'Controller not found' });
       return;
     }
@@ -218,16 +223,16 @@ router.patch(
 
     const updates = parsed.data;
 
-    // Verify org ownership
+    // Verify org ownership and site access
     const { rows: ownerRows } = await pool.query(
-      `SELECT it.id FROM irrigation_turns it
+      `SELECT it.id, d.site_id FROM irrigation_turns it
          JOIN controllers c ON c.id = it.controller_id
          JOIN devices d     ON d.id = c.device_id
         WHERE it.id = $1 AND d.organization_id = $2`,
       [turn_id, req.user!.organization_id],
     );
 
-    if (!ownerRows[0]) {
+    if (!ownerRows[0] || !userHasSiteAccess(req.user!.site_ids, ownerRows[0].site_id)) {
       res.status(404).json({ error: 'Irrigation turn not found' });
       return;
     }

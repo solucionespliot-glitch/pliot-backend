@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { pool } from '../../db';
-import { requireAuth, requireOrg } from '../../middleware/auth';
+import { requireAuth, requireOrg, userHasSiteAccess, siteAccessFilter } from '../../middleware/auth';
 
 const router = Router();
 
@@ -55,13 +55,19 @@ router.get('/me', requireAuth, requireOrg, async (req: Request, res: Response): 
 // ─── GET /dashboard/sites ────────────────────────────────────────────────────
 router.get('/sites', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   try {
+    // Restrict to allowed sites when the user has a site_ids restriction
+    const sf = siteAccessFilter(req.user!.site_ids, 'id', 2);
+    const params: unknown[] = [req.user!.organization_id];
+    if (sf.param) params.push(sf.param);
+
     const { rows } = await pool.query(
       `SELECT id, name, latitude, longitude, timezone, enabled, created_at
          FROM sites
         WHERE organization_id = $1
           AND enabled = true
+          ${sf.clause}
         ORDER BY name ASC`,
-      [req.user!.organization_id],
+      params,
     );
     res.json(rows);
   } catch (err) {
@@ -74,6 +80,12 @@ router.get('/sites', requireAuth, requireOrg, async (req: Request, res: Response
 router.get('/sites/:site_id/devices', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { site_id } = req.params;
   const { zone_id } = req.query;
+
+  // Enforce site-level access restriction
+  if (!userHasSiteAccess(req.user!.site_ids, site_id)) {
+    res.status(403).json({ error: 'Access denied to this site' });
+    return;
+  }
 
   const params: unknown[] = [req.user!.organization_id, site_id];
   let zoneFilter = '';
@@ -155,12 +167,17 @@ router.patch('/devices/:device_id', requireAuth, requireOrg, async (req: Request
   const { display_name } = parsed.data;
 
   try {
+    const sf = siteAccessFilter(req.user!.site_ids, 'site_id', 4);
+    const updateParams: unknown[] = [display_name, device_id, req.user!.organization_id];
+    if (sf.param) updateParams.push(sf.param);
+
     const { rowCount } = await pool.query(
       `UPDATE devices
           SET display_name = $1, updated_at = NOW()
         WHERE device_id = $2
-          AND organization_id = $3`,
-      [display_name, device_id, req.user!.organization_id],
+          AND organization_id = $3
+          ${sf.clause}`,
+      updateParams,
     );
 
     if (rowCount === 0) {
@@ -186,9 +203,14 @@ router.get('/devices/:device_id/telemetry', requireAuth, requireOrg, async (req:
   }
 
   try {
+    // Fetch device and include site_id to enforce site-level access restriction
+    const sf = siteAccessFilter(req.user!.site_ids, 'site_id', 3);
+    const devParams: unknown[] = [device_id, req.user!.organization_id];
+    if (sf.param) devParams.push(sf.param);
+
     const { rows: devRows } = await pool.query(
-      `SELECT id FROM devices WHERE device_id = $1 AND organization_id = $2`,
-      [device_id, req.user!.organization_id],
+      `SELECT id FROM devices WHERE device_id = $1 AND organization_id = $2 ${sf.clause}`,
+      devParams,
     );
     if (!devRows[0]) {
       res.status(404).json({ error: 'Device not found' });

@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { pool } from '../../db';
-import { requireAuth, requireOrg } from '../../middleware/auth';
+import { requireAuth, requireOrg, userHasSiteAccess } from '../../middleware/auth';
 
 const router = Router();
 
@@ -153,6 +153,7 @@ router.get('/cycles/:cycle_id', requireAuth, requireOrg, async (req: Request, re
           c.notes, c.created_by, c.created_at,
           c.degree_days_to_date,
           c.degree_days_calc_date,
+          l.site_id,
           m.last_monitored_at,
           CASE
             WHEN m.last_monitored_at IS NOT NULL
@@ -170,7 +171,7 @@ router.get('/cycles/:cycle_id', requireAuth, requireOrg, async (req: Request, re
       [cycle_id, req.user!.organization_id],
     );
 
-    if (!rows[0]) {
+    if (!rows[0] || !userHasSiteAccess(req.user!.site_ids, rows[0].site_id)) {
       res.status(404).json({ error: 'Cycle not found' });
       return;
     }
@@ -272,12 +273,12 @@ router.get('/lots/:lot_id/cycles', requireAuth, requireOrg, async (req: Request,
   const { lot_id } = req.params;
 
   try {
-    // Verify lot belongs to this org
+    // Verify lot belongs to this org and user has site access
     const { rows: lotRows } = await pool.query(
-      `SELECT id FROM lots WHERE id = $1 AND organization_id = $2`,
+      `SELECT id, site_id FROM lots WHERE id = $1 AND organization_id = $2`,
       [lot_id, req.user!.organization_id],
     );
-    if (!lotRows[0]) {
+    if (!lotRows[0] || !userHasSiteAccess(req.user!.site_ids, lotRows[0].site_id)) {
       res.status(404).json({ error: 'Lot not found' });
       return;
     }
@@ -338,12 +339,12 @@ router.post('/lots/:lot_id/cycles', requireAuth, requireOrg, async (req: Request
   try {
     await client.query('BEGIN');
 
-    // Verify lot belongs to this org
+    // Verify lot belongs to this org and user has site access
     const { rows: lotRows } = await client.query(
-      `SELECT id FROM lots WHERE id = $1 AND organization_id = $2`,
+      `SELECT id, site_id FROM lots WHERE id = $1 AND organization_id = $2`,
       [lot_id, req.user!.organization_id],
     );
-    if (!lotRows[0]) {
+    if (!lotRows[0] || !userHasSiteAccess(req.user!.site_ids, lotRows[0].site_id)) {
       await client.query('ROLLBACK');
       res.status(404).json({ error: 'Lot not found' });
       return;
@@ -389,16 +390,16 @@ router.patch('/cycles/:cycle_id/close', requireAuth, requireOrg, async (req: Req
   const { ended_at } = parsed.data;
 
   try {
-    // Verify cycle belongs to a lot of this org and is still active
+    // Verify cycle belongs to a lot of this org and user has site access
     const { rows } = await pool.query(
-      `SELECT c.id, c.ended_at
+      `SELECT c.id, c.ended_at, l.site_id
          FROM lot_cycles c
          JOIN lots l ON l.id = c.lot_id
         WHERE c.id = $1 AND l.organization_id = $2`,
       [cycle_id, req.user!.organization_id],
     );
 
-    if (!rows[0]) {
+    if (!rows[0] || !userHasSiteAccess(req.user!.site_ids, rows[0].site_id)) {
       res.status(404).json({ error: 'Cycle not found' });
       return;
     }
@@ -426,15 +427,15 @@ router.get('/cycles/:cycle_id/monitoring-items', requireAuth, requireOrg, async 
   const { cycle_id } = req.params;
 
   try {
-    // Verify cycle belongs to a lot of this org
+    // Verify cycle belongs to a lot of this org and user has site access
     const { rows: cycleRows } = await pool.query(
-      `SELECT c.id, c.crop_type
+      `SELECT c.id, c.crop_type, l.site_id
          FROM lot_cycles c
          JOIN lots l ON l.id = c.lot_id
         WHERE c.id = $1 AND l.organization_id = $2`,
       [cycle_id, req.user!.organization_id],
     );
-    if (!cycleRows[0]) {
+    if (!cycleRows[0] || !userHasSiteAccess(req.user!.site_ids, cycleRows[0].site_id)) {
       res.status(404).json({ error: 'Cycle not found' });
       return;
     }
@@ -460,15 +461,15 @@ router.get('/cycles/:cycle_id/monitorings', requireAuth, requireOrg, async (req:
   const { cycle_id } = req.params;
 
   try {
-    // Verify cycle belongs to a lot of this org
+    // Verify cycle belongs to a lot of this org and user has site access
     const { rows: cycleRows } = await pool.query(
-      `SELECT c.id
+      `SELECT c.id, l.site_id
          FROM lot_cycles c
          JOIN lots l ON l.id = c.lot_id
         WHERE c.id = $1 AND l.organization_id = $2`,
       [cycle_id, req.user!.organization_id],
     );
-    if (!cycleRows[0]) {
+    if (!cycleRows[0] || !userHasSiteAccess(req.user!.site_ids, cycleRows[0].site_id)) {
       res.status(404).json({ error: 'Cycle not found' });
       return;
     }
@@ -530,15 +531,15 @@ router.post('/cycles/:cycle_id/monitorings', requireAuth, requireOrg, async (req
   try {
     await client.query('BEGIN');
 
-    // Fetch cycle and verify org ownership
+    // Fetch cycle and verify org ownership and site access
     const { rows: cycleRows } = await client.query(
-      `SELECT c.id, c.crop_type, c.started_at, c.ended_at, l.id AS lot_id
+      `SELECT c.id, c.crop_type, c.started_at, c.ended_at, l.id AS lot_id, l.site_id
          FROM lot_cycles c
          JOIN lots l ON l.id = c.lot_id
         WHERE c.id = $1 AND l.organization_id = $2`,
       [cycle_id, req.user!.organization_id],
     );
-    if (!cycleRows[0]) {
+    if (!cycleRows[0] || !userHasSiteAccess(req.user!.site_ids, cycleRows[0].site_id)) {
       await client.query('ROLLBACK');
       res.status(404).json({ error: 'Cycle not found' });
       return;
@@ -630,15 +631,15 @@ router.get('/cycles/:cycle_id/events', requireAuth, requireOrg, async (req: Requ
   const { cycle_id } = req.params;
 
   try {
-    // Verify cycle belongs to a lot of this org
+    // Verify cycle belongs to a lot of this org and user has site access
     const { rows: cycleRows } = await pool.query(
-      `SELECT c.id
+      `SELECT c.id, l.site_id
          FROM lot_cycles c
          JOIN lots l ON l.id = c.lot_id
         WHERE c.id = $1 AND l.organization_id = $2`,
       [cycle_id, req.user!.organization_id],
     );
-    if (!cycleRows[0]) {
+    if (!cycleRows[0] || !userHasSiteAccess(req.user!.site_ids, cycleRows[0].site_id)) {
       res.status(404).json({ error: 'Cycle not found' });
       return;
     }
@@ -679,15 +680,15 @@ router.post('/cycles/:cycle_id/events', requireAuth, requireOrg, async (req: Req
   }
 
   try {
-    // Verify cycle belongs to this org and is still active; also fetch started_at for ddt
+    // Verify cycle belongs to this org, user has site access, and cycle is still active
     const { rows: cycleRows } = await pool.query(
-      `SELECT c.id, c.ended_at, c.started_at, l.id AS lot_id
+      `SELECT c.id, c.ended_at, c.started_at, l.id AS lot_id, l.site_id
          FROM lot_cycles c
          JOIN lots l ON l.id = c.lot_id
         WHERE c.id = $1 AND l.organization_id = $2`,
       [cycle_id, req.user!.organization_id],
     );
-    if (!cycleRows[0]) {
+    if (!cycleRows[0] || !userHasSiteAccess(req.user!.site_ids, cycleRows[0].site_id)) {
       res.status(404).json({ error: 'Cycle not found' });
       return;
     }

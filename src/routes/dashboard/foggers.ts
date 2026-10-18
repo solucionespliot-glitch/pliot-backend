@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { pool } from '../../db';
-import { requireAuth, requireOrg, requireRole } from '../../middleware/auth';
+import { requireAuth, requireOrg, requireRole, siteAccessFilter } from '../../middleware/auth';
 
 const router = Router();
 
@@ -9,6 +9,10 @@ const router = Router();
 // Fogger controllers with current online status and behavior_config
 
 router.get('/', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  const sf = siteAccessFilter(req.user!.site_ids, 'd.site_id', 2);
+  const params: unknown[] = [req.user!.organization_id];
+  if (sf.param) params.push(sf.param);
+
   const { rows } = await pool.query(
     `SELECT
         c.id                          AS controller_id,
@@ -33,8 +37,9 @@ router.get('/', requireAuth, requireOrg, async (req: Request, res: Response): Pr
        JOIN actuators a    ON a.controller_id = c.id
       WHERE d.organization_id = $1
         AND a.actuator_type   = 'fogger'
+        ${sf.clause}
       ORDER BY COALESCE(d.legacy_device_name, d.device_id) ASC, a.relay_index ASC`,
-    [req.user!.organization_id],
+    params,
   );
 
   res.json({ foggers: rows });
@@ -97,7 +102,11 @@ router.patch(
       return;
     }
 
-    // Verify actuator belongs to org and is a fogger
+    // Verify actuator belongs to org (and site if restricted) and is a fogger
+    const sf = siteAccessFilter(req.user!.site_ids, 'd.site_id', 4);
+    const updateParams: unknown[] = [JSON.stringify(parsed.data), req.params.id, req.user!.organization_id];
+    if (sf.param) updateParams.push(sf.param);
+
     const { rows } = await pool.query(
       `UPDATE actuators a
           SET behavior_config = $1,
@@ -108,8 +117,9 @@ router.patch(
           AND a.controller_id   = c.id
           AND a.actuator_type   = 'fogger'
           AND d.organization_id = $3
+          ${sf.clause}
         RETURNING a.id, a.label, a.behavior_config`,
-      [JSON.stringify(parsed.data), req.params.id, req.user!.organization_id],
+      updateParams,
     );
 
     if (!rows[0]) {

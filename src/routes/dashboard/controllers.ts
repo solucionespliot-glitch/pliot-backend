@@ -1,13 +1,17 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { pool } from '../../db';
-import { requireAuth, requireOrg, requireRole } from '../../middleware/auth';
+import { requireAuth, requireOrg, requireRole, userHasSiteAccess, siteAccessFilter } from '../../middleware/auth';
 
 const router = Router();
 
 // GET /dashboard/controllers
 // List controllers with sync_status, override_mode, last heartbeat
 router.get('/', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  const sf = siteAccessFilter(req.user!.site_ids, 'd.site_id', 2);
+  const params: unknown[] = [req.user!.organization_id];
+  if (sf.param) params.push(sf.param);
+
   const { rows } = await pool.query(
     `SELECT
         c.id,
@@ -29,8 +33,9 @@ router.get('/', requireAuth, requireOrg, async (req: Request, res: Response): Pr
        FROM controllers c
        JOIN devices d ON d.id = c.device_id
       WHERE d.organization_id = $1
+        ${sf.clause}
       ORDER BY COALESCE(d.legacy_device_name, d.device_id) ASC`,
-    [req.user!.organization_id],
+    params,
   );
 
   res.json({ controllers: rows });
@@ -57,17 +62,26 @@ router.patch(
 
     const { override_mode, override_expires_at } = parsed.data;
 
+    // Verify controller belongs to org and user has site access
+    const { rows: ctrlCheck } = await pool.query(
+      `SELECT c.id, d.site_id FROM controllers c
+         JOIN devices d ON d.id = c.device_id
+        WHERE c.id = $1 AND d.organization_id = $2`,
+      [req.params.id, req.user!.organization_id],
+    );
+    if (!ctrlCheck[0] || !userHasSiteAccess(req.user!.site_ids, ctrlCheck[0].site_id)) {
+      res.status(404).json({ error: 'Controller not found' });
+      return;
+    }
+
     const { rows } = await pool.query(
-      `UPDATE controllers c
+      `UPDATE controllers
           SET override_mode       = $1,
               override_expires_at = $2,
               updated_at          = NOW()
-         FROM devices d
-        WHERE c.device_id       = d.id
-          AND c.id              = $3
-          AND d.organization_id = $4
-        RETURNING c.id, c.override_mode, c.override_expires_at`,
-      [override_mode, override_expires_at ?? null, req.params.id, req.user!.organization_id],
+        WHERE id = $3
+        RETURNING id, override_mode, override_expires_at`,
+      [override_mode, override_expires_at ?? null, req.params.id],
     );
 
     if (!rows[0]) {
@@ -108,18 +122,27 @@ router.patch(
       return;
     }
 
+    // Verify controller belongs to org and user has site access
+    const { rows: ctrlCheck } = await pool.query(
+      `SELECT c.id, d.site_id FROM controllers c
+         JOIN devices d ON d.id = c.device_id
+        WHERE c.id = $1 AND d.organization_id = $2`,
+      [req.params.id, req.user!.organization_id],
+    );
+    if (!ctrlCheck[0] || !userHasSiteAccess(req.user!.site_ids, ctrlCheck[0].site_id)) {
+      res.status(404).json({ error: 'Controller not found' });
+      return;
+    }
+
     const { rows } = await pool.query(
-      `UPDATE controllers c
-          SET context      = COALESCE(c.context, '{}'::jsonb) || $1::jsonb,
+      `UPDATE controllers
+          SET context      = COALESCE(context, '{}'::jsonb) || $1::jsonb,
               sync_status  = 'pending',
-              config_version = c.config_version + 1,
+              config_version = config_version + 1,
               updated_at   = NOW()
-         FROM devices d
-        WHERE c.device_id       = d.id
-          AND c.id              = $2
-          AND d.organization_id = $3
-        RETURNING c.id, c.context, c.config_version, c.sync_status`,
-      [JSON.stringify(parsed.data), req.params.id, req.user!.organization_id],
+        WHERE id = $2
+        RETURNING id, context, config_version, sync_status`,
+      [JSON.stringify(parsed.data), req.params.id],
     );
 
     if (!rows[0]) {
@@ -141,14 +164,14 @@ router.get(
   requireAuth,
   requireOrg,
   async (req: Request, res: Response): Promise<void> => {
-    // Verify controller belongs to the requesting org
+    // Verify controller belongs to org and user has site access
     const { rows: ctrlRows } = await pool.query(
-      `SELECT c.id FROM controllers c
+      `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
         WHERE c.id = $1 AND d.organization_id = $2`,
       [req.params.id, req.user!.organization_id],
     );
-    if (!ctrlRows[0]) {
+    if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
       res.status(404).json({ error: 'Controller not found' });
       return;
     }
@@ -252,12 +275,12 @@ router.put(
     }
 
     const { rows: ctrlRows } = await pool.query(
-      `SELECT c.id FROM controllers c
+      `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
         WHERE c.id = $1 AND d.organization_id = $2`,
       [req.params.id, req.user!.organization_id],
     );
-    if (!ctrlRows[0]) {
+    if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
       res.status(404).json({ error: 'Controller not found' });
       return;
     }
@@ -320,12 +343,12 @@ router.put(
     const { node_ids } = parsed.data;
 
     const { rows: ctrlRows } = await pool.query(
-      `SELECT c.id FROM controllers c
+      `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
         WHERE c.id = $1 AND d.organization_id = $2`,
       [req.params.id, req.user!.organization_id],
     );
-    if (!ctrlRows[0]) {
+    if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
       res.status(404).json({ error: 'Controller not found' });
       return;
     }
@@ -412,14 +435,14 @@ router.post(
       return;
     }
 
-    // Verify controller belongs to the requesting org
+    // Verify controller belongs to org and user has site access
     const { rows: ctrlRows } = await pool.query(
-      `SELECT c.id FROM controllers c
+      `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
         WHERE c.id = $1 AND d.organization_id = $2`,
       [req.params.id, req.user!.organization_id],
     );
-    if (!ctrlRows[0]) {
+    if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
       res.status(404).json({ error: 'Controller not found' });
       return;
     }

@@ -164,3 +164,41 @@ export function requireRole(allowedRoles: string[]) {
 export function roleRank(role: string): number {
   return ROLE_HIERARCHY.indexOf(role);
 }
+
+// ─── Site access helpers ──────────────────────────────────────────────────────
+// Enforce site-level access restrictions stored in user_roles.site_ids.
+// An empty site_ids means no restriction — the user sees all sites in their org.
+
+/**
+ * Returns true if the user has access to the given site.
+ * Users with an empty site_ids list have unrestricted access to all org sites.
+ */
+export function userHasSiteAccess(siteIds: string[], siteId: string): boolean {
+  if (!siteIds || siteIds.length === 0) return true;
+  return siteIds.includes(siteId);
+}
+
+/**
+ * Builds a SQL fragment for site-based filtering in list queries.
+ * When site_ids is empty, returns an empty clause (no restriction).
+ * paramIdx is the $N index that will hold the site_ids array parameter.
+ *
+ * Usage:
+ *   const sf = siteAccessFilter(req.user!.site_ids, 'd.site_id', 2);
+ *   const params: unknown[] = [req.user!.organization_id];
+ *   if (sf.param) params.push(sf.param);
+ *   pool.query(`SELECT ... WHERE org_id = $1 ${sf.clause}`, params);
+ */
+export function siteAccessFilter(
+  siteIds: string[],
+  column: string,
+  paramIdx: number,
+): { clause: string; param: string[] | null } {
+  if (!siteIds || siteIds.length === 0) {
+    return { clause: '', param: null };
+  }
+  return {
+    clause: `AND ${column} = ANY($${paramIdx}::uuid[])`,
+    param: siteIds,
+  };
+}

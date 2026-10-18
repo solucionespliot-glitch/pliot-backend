@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { pool } from '../../db';
-import { requireAuth, requireOrg } from '../../middleware/auth';
+import { requireAuth, requireOrg, userHasSiteAccess } from '../../middleware/auth';
 
 const router = Router();
 
@@ -38,6 +38,11 @@ const createEventSchema = z.object({
 // Returns all lots for a site, including their assigned nodes and latest event.
 router.get('/sites/:site_id/lots', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { site_id } = req.params;
+
+  if (!userHasSiteAccess(req.user!.site_ids, site_id)) {
+    res.status(403).json({ error: 'Access denied to this site' });
+    return;
+  }
 
   try {
     // Main lot list with latest event joined
@@ -125,6 +130,11 @@ router.get('/sites/:site_id/lots', requireAuth, requireOrg, async (req: Request,
 router.post('/sites/:site_id/lots', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { site_id } = req.params;
 
+  if (!userHasSiteAccess(req.user!.site_ids, site_id)) {
+    res.status(403).json({ error: 'Access denied to this site' });
+    return;
+  }
+
   const parsed = createLotSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: parsed.error.issues[0].message });
@@ -176,14 +186,14 @@ router.get('/lots/:lot_id', requireAuth, requireOrg, async (req: Request, res: R
   const { lot_id } = req.params;
 
   try {
-    // Lot basic data
+    // Lot basic data — include site_id to enforce site access restriction
     const { rows: lotRows } = await pool.query(
-      `SELECT id, name, crop_type, area_ha, status, notes, created_at, updated_at
+      `SELECT id, name, crop_type, area_ha, status, notes, created_at, updated_at, site_id
          FROM lots
         WHERE id = $1 AND organization_id = $2`,
       [lot_id, req.user!.organization_id],
     );
-    if (!lotRows[0]) {
+    if (!lotRows[0] || !userHasSiteAccess(req.user!.site_ids, lotRows[0].site_id)) {
       res.status(404).json({ error: 'Lot not found' });
       return;
     }
@@ -263,6 +273,17 @@ router.patch('/lots/:lot_id', requireAuth, requireOrg, async (req: Request, res:
   try {
     await client.query('BEGIN');
 
+    // Verify site access before modifying
+    const { rows: siteCheckRows } = await client.query(
+      `SELECT site_id FROM lots WHERE id = $1 AND organization_id = $2`,
+      [lot_id, req.user!.organization_id],
+    );
+    if (!siteCheckRows[0] || !userHasSiteAccess(req.user!.site_ids, siteCheckRows[0].site_id)) {
+      await client.query('ROLLBACK');
+      res.status(404).json({ error: 'Lot not found' });
+      return;
+    }
+
     // Build dynamic SET clause — only update provided fields
     const updates: string[] = ['updated_at = NOW()'];
     const values: unknown[] = [];
@@ -321,9 +342,19 @@ router.delete('/lots/:lot_id', requireAuth, requireOrg, async (req: Request, res
   const { lot_id } = req.params;
 
   try {
-    const { rowCount } = await pool.query(
-      `DELETE FROM lots WHERE id = $1 AND organization_id = $2`,
+    // Verify site access before deleting
+    const { rows: siteCheckRows } = await pool.query(
+      `SELECT site_id FROM lots WHERE id = $1 AND organization_id = $2`,
       [lot_id, req.user!.organization_id],
+    );
+    if (!siteCheckRows[0] || !userHasSiteAccess(req.user!.site_ids, siteCheckRows[0].site_id)) {
+      res.status(404).json({ error: 'Lot not found' });
+      return;
+    }
+
+    const { rowCount } = await pool.query(
+      `DELETE FROM lots WHERE id = $1`,
+      [lot_id],
     );
     if (rowCount === 0) {
       res.status(404).json({ error: 'Lot not found' });
@@ -341,12 +372,12 @@ router.get('/lots/:lot_id/events', requireAuth, requireOrg, async (req: Request,
   const { lot_id } = req.params;
 
   try {
-    // Verify lot belongs to this org
+    // Verify lot belongs to this org and user has site access
     const { rows: lotRows } = await pool.query(
-      `SELECT id FROM lots WHERE id = $1 AND organization_id = $2`,
+      `SELECT id, site_id FROM lots WHERE id = $1 AND organization_id = $2`,
       [lot_id, req.user!.organization_id],
     );
-    if (!lotRows[0]) {
+    if (!lotRows[0] || !userHasSiteAccess(req.user!.site_ids, lotRows[0].site_id)) {
       res.status(404).json({ error: 'Lot not found' });
       return;
     }
@@ -378,12 +409,12 @@ router.post('/lots/:lot_id/events', requireAuth, requireOrg, async (req: Request
   const { event_type, occurred_at, notes, data } = parsed.data;
 
   try {
-    // Verify lot belongs to this org
+    // Verify lot belongs to this org and user has site access
     const { rows: lotRows } = await pool.query(
-      `SELECT id FROM lots WHERE id = $1 AND organization_id = $2`,
+      `SELECT id, site_id FROM lots WHERE id = $1 AND organization_id = $2`,
       [lot_id, req.user!.organization_id],
     );
-    if (!lotRows[0]) {
+    if (!lotRows[0] || !userHasSiteAccess(req.user!.site_ids, lotRows[0].site_id)) {
       res.status(404).json({ error: 'Lot not found' });
       return;
     }

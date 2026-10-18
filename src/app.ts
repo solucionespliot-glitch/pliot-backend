@@ -55,10 +55,15 @@ app.use(helmet());
 // General rate limit: 100 req / 15 min per IP
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 100,
+  max: 500,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' },
+  // Traffic arrives via Cloudflare → nginx, so req.ip is the Cloudflare edge IP.
+  // CF-Connecting-IP is set by Cloudflare to the real client IP and cannot be
+  // spoofed from outside. Fall back to req.ip for direct/local connections.
+  keyGenerator: (req) =>
+    (req.headers['cf-connecting-ip'] as string) || req.ip || 'unknown',
 });
 
 // Ingestion rate limit: 300 req / 1 min per IP (devices send frequently)
