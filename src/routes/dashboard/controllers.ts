@@ -223,6 +223,10 @@ const VpdConfigSchema = z.object({
   vpd_logic:            z.enum(['any', 'all', 'average']).default('any'),
   hysteresis:           z.number().min(0).max(2).default(0.1),
   stale_timeout_minutes: z.number().int().min(1).max(60).default(15),
+  // Optional active time window — if set, VPD activation is only allowed within this range.
+  // Both fields must be present together; if absent, VPD runs all day.
+  active_window_start:  TimeHHMM.optional(),
+  active_window_end:    TimeHHMM.optional(),
 });
 
 const ScheduleWindowSchema = z.object({
@@ -230,9 +234,15 @@ const ScheduleWindowSchema = z.object({
   off_time: TimeHHMM,
 });
 
+// Schedule supports multiple day-groups so different days can have different windows.
+// Example: Mon+Wed → 2h ventilation, rest of week → 30 min.
 const ScheduleConfigSchema = z.object({
-  days:    z.array(z.number().int().min(1).max(7)).min(1).max(7),
-  windows: z.array(ScheduleWindowSchema).min(1).max(10),
+  groups: z.array(
+    z.object({
+      days:    z.array(z.number().int().min(1).max(7)).min(1).max(7),
+      windows: z.array(ScheduleWindowSchema).min(1).max(10),
+    }),
+  ).min(1).max(7),
 });
 
 const IrrigationEventSchema = z.object({
@@ -240,9 +250,14 @@ const IrrigationEventSchema = z.object({
   duration_minutes:   z.number().int().min(1).max(1440),
 });
 
+// Irrigation also supports multiple day-groups.
 const IrrigationConfigSchema = z.object({
-  days:   z.array(z.number().int().min(1).max(7)).min(1).max(7),
-  events: z.array(IrrigationEventSchema).min(1).max(20),
+  groups: z.array(
+    z.object({
+      days:   z.array(z.number().int().min(1).max(7)).min(1).max(7),
+      events: z.array(IrrigationEventSchema).min(1).max(20),
+    }),
+  ).min(1).max(7),
 });
 
 const TemperatureConfigSchema = z.object({
@@ -255,11 +270,13 @@ const TemperatureConfigSchema = z.object({
 
 // Top-level schema: accepts behavior_type + matching config, or partial merge.
 const ActuatorUpdateSchema = z.discriminatedUnion('behavior_type', [
-  z.object({ behavior_type: z.literal('vpd'),         behavior_config: VpdConfigSchema }),
-  z.object({ behavior_type: z.literal('schedule'),    behavior_config: ScheduleConfigSchema }),
-  z.object({ behavior_type: z.literal('irrigation'),  behavior_config: IrrigationConfigSchema }),
-  z.object({ behavior_type: z.literal('temperature'), behavior_config: TemperatureConfigSchema }),
-  z.object({ behavior_type: z.literal('manual'),      behavior_config: z.object({}).optional() }),
+  z.object({ behavior_type: z.literal('vpd'),                behavior_config: VpdConfigSchema }),
+  z.object({ behavior_type: z.literal('schedule'),           behavior_config: ScheduleConfigSchema }),
+  z.object({ behavior_type: z.literal('irrigation'),         behavior_config: IrrigationConfigSchema }),
+  z.object({ behavior_type: z.literal('temperature'),        behavior_config: TemperatureConfigSchema }),
+  z.object({ behavior_type: z.literal('manual'),             behavior_config: z.object({}).optional() }),
+  // Relay is managed by the crop irrigation program module — no direct config here.
+  z.object({ behavior_type: z.literal('blocked_by_program'), behavior_config: z.object({}).optional() }),
 ]);
 
 router.put(
