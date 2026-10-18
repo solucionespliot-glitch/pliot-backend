@@ -66,7 +66,7 @@ router.patch(
     const { rows: ctrlCheck } = await pool.query(
       `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
-        WHERE c.id = $1 AND d.organization_id = $2`,
+        WHERE c.id = $1 AND ($2::uuid IS NULL OR d.organization_id = $2::uuid)`,
       [req.params.id, req.user!.organization_id],
     );
     if (!ctrlCheck[0] || !userHasSiteAccess(req.user!.site_ids, ctrlCheck[0].site_id)) {
@@ -126,7 +126,7 @@ router.patch(
     const { rows: ctrlCheck } = await pool.query(
       `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
-        WHERE c.id = $1 AND d.organization_id = $2`,
+        WHERE c.id = $1 AND ($2::uuid IS NULL OR d.organization_id = $2::uuid)`,
       [req.params.id, req.user!.organization_id],
     );
     if (!ctrlCheck[0] || !userHasSiteAccess(req.user!.site_ids, ctrlCheck[0].site_id)) {
@@ -168,7 +168,7 @@ router.get(
     const { rows: ctrlRows } = await pool.query(
       `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
-        WHERE c.id = $1 AND d.organization_id = $2`,
+        WHERE c.id = $1 AND ($2::uuid IS NULL OR d.organization_id = $2::uuid)`,
       [req.params.id, req.user!.organization_id],
     );
     if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
@@ -294,7 +294,7 @@ router.put(
     const { rows: ctrlRows } = await pool.query(
       `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
-        WHERE c.id = $1 AND d.organization_id = $2`,
+        WHERE c.id = $1 AND ($2::uuid IS NULL OR d.organization_id = $2::uuid)`,
       [req.params.id, req.user!.organization_id],
     );
     if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
@@ -359,7 +359,7 @@ router.patch(
     const { rows: ctrlRows } = await pool.query(
       `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
-        WHERE c.id = $1 AND d.organization_id = $2`,
+        WHERE c.id = $1 AND ($2::uuid IS NULL OR d.organization_id = $2::uuid)`,
       [req.params.id, req.user!.organization_id],
     );
     if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
@@ -410,7 +410,7 @@ router.put(
     const { rows: ctrlRows } = await pool.query(
       `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
-        WHERE c.id = $1 AND d.organization_id = $2`,
+        WHERE c.id = $1 AND ($2::uuid IS NULL OR d.organization_id = $2::uuid)`,
       [req.params.id, req.user!.organization_id],
     );
     if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
@@ -430,7 +430,7 @@ router.put(
     // All nodes must belong to the same org to prevent cross-tenant data access
     if (node_ids.length > 0) {
       const { rows: nodeRows } = await pool.query(
-        `SELECT id FROM devices WHERE id = ANY($1::uuid[]) AND organization_id = $2`,
+        `SELECT id FROM devices WHERE id = ANY($1::uuid[]) AND ($2::uuid IS NULL OR organization_id = $2::uuid)`,
         [node_ids, req.user!.organization_id],
       );
       if (nodeRows.length !== node_ids.length) {
@@ -504,7 +504,7 @@ router.post(
     const { rows: ctrlRows } = await pool.query(
       `SELECT c.id, d.site_id FROM controllers c
          JOIN devices d ON d.id = c.device_id
-        WHERE c.id = $1 AND d.organization_id = $2`,
+        WHERE c.id = $1 AND ($2::uuid IS NULL OR d.organization_id = $2::uuid)`,
       [req.params.id, req.user!.organization_id],
     );
     if (!ctrlRows[0] || !userHasSiteAccess(req.user!.site_ids, ctrlRows[0].site_id)) {
