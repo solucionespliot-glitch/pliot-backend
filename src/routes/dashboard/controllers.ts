@@ -486,7 +486,13 @@ const PulseRelaySchema = z.object({
   duration_minutes:  z.number().int().min(1).max(120),
 });
 
-const CommandSchema = PulseRelaySchema; // extend with z.union([...]) as new types are added
+// Immediately turns off a relay and clears any active pulse timer on the device.
+const StopRelaySchema = z.object({
+  command_type: z.literal('stopRelay'),
+  relay_index:  z.number().int().min(0).max(7),
+});
+
+const CommandSchema = z.union([PulseRelaySchema, StopRelaySchema]);
 
 router.post(
   '/:id/commands',
