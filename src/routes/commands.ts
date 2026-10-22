@@ -187,7 +187,14 @@ router.post('/:id/heartbeat', requireCommandScope, async (req: Request, res: Res
     [ctrl.id],
   );
 
-  res.json({ ok: true, has_pending_commands: cmdRows.length > 0 });
+  res.json({
+    ok:                   true,
+    has_pending_commands: cmdRows.length > 0,
+    // True when the DB config_version is ahead of what the device reported.
+    // The firmware calls fetchSnapshot() immediately on seeing this flag,
+    // without waiting for a requestSync command to be created manually.
+    needs_sync:           !inSync,
+  });
 });
 
 // ─── GET /api/v1.5/controllers/:id/readings ──────────────────────────────────
