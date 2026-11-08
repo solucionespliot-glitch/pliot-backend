@@ -125,9 +125,10 @@ router.get('/:id/snapshot', requireCommandScope, async (req: Request, res: Respo
 const HeartbeatSchema = z.object({
   config_version: z.number().int().nonnegative(),
   relay_states:   z.array(z.boolean()).max(8).optional(),
-  // cycle_states: one entry per relay (independent mode) or repeated coordinator
-  // state for all relays (cascade mode). Replaces the old single cycle_state field.
+  // cycle_states: per-relay cycle state derived from physical relay state + eligibility.
   cycle_states:   z.array(z.enum(['IDLE', 'CYCLE_ON', 'CYCLE_OFF'])).max(8).optional(),
+  // paused_states: true for each relay currently paused by a pauseRelay command.
+  paused_states:  z.array(z.boolean()).max(8).optional(),
   uptime_seconds: z.number().int().nonnegative().optional(),
   wifi_rssi:      z.number().int().optional(),
 });
@@ -141,7 +142,7 @@ router.post('/:id/heartbeat', requireCommandScope, async (req: Request, res: Res
     return;
   }
 
-  const { config_version, relay_states, cycle_states, uptime_seconds, wifi_rssi } = parsed.data;
+  const { config_version, relay_states, cycle_states, paused_states, uptime_seconds, wifi_rssi } = parsed.data;
 
   const { rows } = await pool.query(
     `SELECT c.id, c.config_version, c.context
@@ -162,6 +163,7 @@ router.post('/:id/heartbeat', requireCommandScope, async (req: Request, res: Res
     ...(ctrl.context ?? {}),
     last_relay_states:   relay_states   ?? null,
     last_cycle_states:   cycle_states   ?? null,
+    last_paused_states:  paused_states  ?? null,
     last_uptime_seconds: uptime_seconds ?? null,
     last_wifi_rssi:      wifi_rssi      ?? null,
   };

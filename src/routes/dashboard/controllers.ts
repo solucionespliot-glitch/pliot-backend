@@ -492,7 +492,21 @@ const StopRelaySchema = z.object({
   relay_index:  z.number().int().min(0).max(7),
 });
 
-const CommandSchema = z.union([PulseRelaySchema, StopRelaySchema]);
+// Pauses a relay: turns it OFF and blocks all behavior controllers (schedule, VPD,
+// irrigation, temperature) for this relay until a resumeRelay command is received.
+// The cascade coordinator also excludes paused relays from the rotation.
+const PauseRelaySchema = z.object({
+  command_type: z.literal('pauseRelay'),
+  relay_index:  z.number().int().min(0).max(7),
+});
+
+// Resumes a paused relay: re-enables behavior controllers for this relay.
+const ResumeRelaySchema = z.object({
+  command_type: z.literal('resumeRelay'),
+  relay_index:  z.number().int().min(0).max(7),
+});
+
+const CommandSchema = z.union([PulseRelaySchema, StopRelaySchema, PauseRelaySchema, ResumeRelaySchema]);
 
 router.post(
   '/:id/commands',
