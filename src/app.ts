@@ -13,6 +13,7 @@ import dashboardFoggersRouter from './routes/dashboard/foggers';
 import dashboardSettingsRouter from './routes/dashboard/settings';
 import dashboardLotsRouter from './routes/dashboard/lots';
 import dashboardCyclesRouter from './routes/dashboard/cycles';
+import dashboardAlarmsRouter from './routes/dashboard/alarms';
 import nurseryCustomersRouter from './routes/dashboard/nursery/customers';
 import nurseryOrdersRouter from './routes/dashboard/nursery/orders';
 import nurseryBatchesRouter from './routes/dashboard/nursery/batches';
@@ -92,6 +93,7 @@ app.get('/health', (_req, res) => {
 app.use('/api/v5', ingestRouter);
 app.use('/api/v1.5/controllers', commandsRouter);
 app.use('/dashboard/admin', adminRouter);
+app.use('/dashboard/alarms', requireAuth, requireOrg, requireFeature('alarms'), dashboardAlarmsRouter);
 app.use('/dashboard/controllers', dashboardControllersRouter);
 app.use('/dashboard/irrigation', dashboardIrrigationRouter);
 app.use('/dashboard', dashboardDevicesRouter);

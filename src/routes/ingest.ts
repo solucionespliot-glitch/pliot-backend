@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { createCipheriv } from 'crypto';
 import { z } from 'zod';
 import { pool } from '../db';
+import { evaluateAlarms } from '../alarms';
 
 const router = Router();
 
@@ -375,6 +376,7 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
       if (Object.keys(extras).length > 0) normFields['extras'] = extras;
 
       updateSensorCapabilities(device.id, normFields);
+      evaluateAlarms(device.id, normFields);
 
       const normCols: string[]    = ['device_id', 'ts'];
       const normParams: unknown[] = [device.id];
@@ -498,8 +500,9 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
 
     if (Object.keys(extras).length > 0) normFields['extras'] = extras;
 
-    // 5. Record which sensor columns this device reported (fire-and-forget)
+    // 5. Record which sensor columns this device reported, and evaluate alarm rules (fire-and-forget)
     updateSensorCapabilities(device.id, normFields);
+    evaluateAlarms(device.id, normFields);
 
     // 6. Build and execute dynamic INSERT into telemetry_norm
     const normCols: string[]    = ['device_id', 'ts'];
@@ -669,8 +672,9 @@ router.post('/lora', requireApiKey, async (req: Request, res: Response): Promise
         normFields['extras'] = extras;
       }
 
-      // Record which sensor columns this device reported (fire-and-forget)
+      // Record which sensor columns this device reported, and evaluate alarm rules (fire-and-forget)
       updateSensorCapabilities(device.id, normFields);
+      evaluateAlarms(device.id, normFields);
 
       // Build INSERT into telemetry_norm
       const normCols: string[]    = ['device_id', 'ts'];
@@ -794,6 +798,7 @@ router.post('/new', async (req: Request, res: Response): Promise<void> => {
     if (Object.keys(extras).length > 0) normFields['extras'] = extras;
 
     updateSensorCapabilities(device.id, normFields);
+    evaluateAlarms(device.id, normFields);
 
     const normCols: string[]    = ['device_id', 'ts'];
     const normParams: unknown[] = [device.id];
