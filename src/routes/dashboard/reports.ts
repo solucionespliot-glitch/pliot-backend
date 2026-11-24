@@ -1,9 +1,13 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { pool } from '../../db';
-import { requireAuth, requireOrg, userHasSiteAccess } from '../../middleware/auth';
+import { requireAuth, requireOrg, userHasSiteAccess, roleRank } from '../../middleware/auth';
 
 const router = Router();
+
+// Producer (rank 2) and above can see/manage all org configs.
+// Advisor (rank 1) and operator (rank 0) only see own + shared configs.
+const PRIVILEGED_RANK = 2;
 
 // ── Validation schemas ────────────────────────────────────────────────────────
 
@@ -24,6 +28,7 @@ const createConfigSchema = z.object({
   schedule_day: z.number().int().min(0).max(31).nullable().optional(),
   params:       reportParamsSchema.optional(),
   enabled:      z.boolean().optional(),
+  is_shared:    z.boolean().optional(),
 });
 
 const patchConfigSchema = createConfigSchema.partial();
@@ -33,9 +38,42 @@ const runSchema = z.object({
   period_end:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'period_end debe ser YYYY-MM-DD'),
 });
 
+// ── Explore schemas ───────────────────────────────────────────────────────────
+
+const VALID_METRICS    = ['temperature', 'humidity', 'vpd', 'co2'] as const;
+const VALID_OPERATORS  = ['gt', 'lt'] as const;
+
+// Map metric name → telemetry_norm column. Whitelisted to prevent SQL injection.
+const METRIC_COL: Record<string, string> = {
+  temperature: 'temperature',
+  humidity:    'humidity',
+  vpd:         'vpd',
+  co2:         'co2',
+};
+
+// Map operator → SQL comparison sign. Whitelisted to prevent SQL injection.
+const OP_SQL: Record<string, string> = {
+  gt: '>',
+  lt: '<',
+};
+
+const exploreQuerySchema = z.object({
+  metric:    z.enum(VALID_METRICS),
+  threshold: z.number(),
+  operator:  z.enum(VALID_OPERATORS),
+  label:     z.string().max(100).optional(),
+});
+
+const exploreSchema = z.object({
+  entity_type: z.enum(['node', 'lot']),
+  entity_id:   z.string().uuid(),
+  date_from:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date_from debe ser YYYY-MM-DD'),
+  date_to:     z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date_to debe ser YYYY-MM-DD'),
+  queries:     z.array(exploreQuerySchema).min(1).max(6),
+});
+
 // ── Helper: compute report result ─────────────────────────────────────────────
 // Performs all telemetry queries for a period and returns the structured result.
-// Reuses the same degree-day pattern from cycles.ts (average temperature per day).
 
 interface ReportParams {
   vpd_threshold:        number;
@@ -63,7 +101,6 @@ async function computeReport(
   if (!cycleRows[0]) throw new Error('Cycle not found');
   const cycle = cycleRows[0];
 
-  // Days since sowing (from cycle start to period end)
   const daysSinceSowing = Math.floor(
     (new Date(periodEnd).getTime() - new Date(cycle.started_at).getTime()) / (1000 * 60 * 60 * 24),
   );
@@ -86,91 +123,67 @@ async function computeReport(
   if (deviceUuids.length > 0) {
     const baseTemp: number = params.degree_day_base ?? cycle.base_temp ?? 10;
 
-    // Degree-days in the report period: average T per day, sum of MAX(avg-base, 0)
     const { rows: ddPeriod } = await pool.query(
       `SELECT COALESCE(SUM(GREATEST(avg_temp - $1, 0)), 0) AS degree_days
          FROM (
-           SELECT DATE_TRUNC('day', ts) AS day,
-                  AVG(temperature)      AS avg_temp
+           SELECT DATE_TRUNC('day', ts) AS day, AVG(temperature) AS avg_temp
              FROM telemetry_norm
-            WHERE device_id = ANY($2)
-              AND ts >= $3
-              AND ts < $4
-              AND temperature IS NOT NULL
+            WHERE device_id = ANY($2) AND ts >= $3 AND ts < $4 AND temperature IS NOT NULL
             GROUP BY 1
          ) daily`,
       [baseTemp, deviceUuids, periodStart, periodEnd],
     );
     degreeDaysPeriod = Number(ddPeriod[0]?.degree_days ?? 0);
 
-    // Degree-days since sowing (from started_at to period_end)
     const { rows: ddTotal } = await pool.query(
       `SELECT COALESCE(SUM(GREATEST(avg_temp - $1, 0)), 0) AS degree_days
          FROM (
-           SELECT DATE_TRUNC('day', ts) AS day,
-                  AVG(temperature)      AS avg_temp
+           SELECT DATE_TRUNC('day', ts) AS day, AVG(temperature) AS avg_temp
              FROM telemetry_norm
-            WHERE device_id = ANY($2)
-              AND ts >= $3
-              AND ts < $4
-              AND temperature IS NOT NULL
+            WHERE device_id = ANY($2) AND ts >= $3 AND ts < $4 AND temperature IS NOT NULL
             GROUP BY 1
          ) daily`,
       [baseTemp, deviceUuids, cycle.started_at, periodEnd],
     );
     degreeDaysSinceSowing = Number(ddTotal[0]?.degree_days ?? 0);
 
-    // Hours with VPD above threshold (one reading = one hour approximation)
     const { rows: vpdRows } = await pool.query(
       `SELECT COUNT(*) AS hours
          FROM telemetry_norm
-        WHERE device_id = ANY($1)
-          AND ts >= $2
-          AND ts < $3
-          AND vpd IS NOT NULL
-          AND vpd > $4`,
+        WHERE device_id = ANY($1) AND ts >= $2 AND ts < $3
+          AND vpd IS NOT NULL AND vpd > $4`,
       [deviceUuids, periodStart, periodEnd, params.vpd_threshold],
     );
     vpdHoursAboveThreshold = Number(vpdRows[0]?.hours ?? 0);
 
-    // Cold hours: hours with temperature <= threshold
     const { rows: coldRows } = await pool.query(
       `SELECT COUNT(*) AS hours
          FROM telemetry_norm
-        WHERE device_id = ANY($1)
-          AND ts >= $2
-          AND ts < $3
-          AND temperature IS NOT NULL
-          AND temperature <= $4`,
+        WHERE device_id = ANY($1) AND ts >= $2 AND ts < $3
+          AND temperature IS NOT NULL AND temperature <= $4`,
       [deviceUuids, periodStart, periodEnd, params.cold_hours_threshold],
     );
     coldHours = Number(coldRows[0]?.hours ?? 0);
   }
 
-  // ── Activities (lot_events in period) ──────────────────────────────────────
   let activities: unknown[] = [];
   if (params.include_activities) {
     const { rows: eventRows } = await pool.query(
       `SELECT event_type, occurred_at, notes, data
          FROM lot_events
-        WHERE lot_id = $1
-          AND occurred_at >= $2
-          AND occurred_at < $3
+        WHERE lot_id = $1 AND occurred_at >= $2 AND occurred_at < $3
         ORDER BY occurred_at ASC`,
       [cycle.lot_id, periodStart, periodEnd],
     );
     activities = eventRows;
   }
 
-  // ── Monitoring scores in period ────────────────────────────────────────────
   let monitoringScores: unknown[] = [];
   if (params.include_monitoring) {
     const { rows: monRows } = await pool.query(
       `SELECT monitored_at, week_number, days_from_transplant, scores, notes
          FROM cycle_monitorings
-        WHERE cycle_id = $1
-          AND monitored_at >= $2
-          AND monitored_at < $3
+        WHERE cycle_id = $1 AND monitored_at >= $2 AND monitored_at < $3
         ORDER BY monitored_at ASC`,
       [cycleId, periodStart, periodEnd],
     );
@@ -196,10 +209,18 @@ async function computeReport(
 
 // ── GET /dashboard/reports/configs ───────────────────────────────────────────
 router.get('/reports/configs', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  // Producer and above see all org configs; advisor/operator only see own or shared.
+  const isPrivileged = roleRank(req.user!.role) >= PRIVILEGED_RANK;
+  const params: unknown[] = [req.user!.organization_id];
+  const visClause = isPrivileged
+    ? ''
+    : `AND (rc.created_by = $${params.push(req.user!.auth0_sub)} OR rc.is_shared = true)`;
+
   try {
     const { rows } = await pool.query(
       `SELECT rc.id, rc.name, rc.site_id, rc.lot_id, rc.cycle_id,
-              rc.schedule, rc.schedule_day, rc.params, rc.enabled, rc.created_at,
+              rc.schedule, rc.schedule_day, rc.params, rc.enabled,
+              rc.created_by, rc.is_shared, rc.created_at,
               l.name  AS lot_name,
               lc.name AS cycle_name,
               lc.crop_type
@@ -207,8 +228,9 @@ router.get('/reports/configs', requireAuth, requireOrg, async (req: Request, res
          LEFT JOIN lots       l  ON l.id  = rc.lot_id
          LEFT JOIN lot_cycles lc ON lc.id = rc.cycle_id
         WHERE rc.organization_id = $1
+          ${visClause}
         ORDER BY rc.created_at DESC`,
-      [req.user!.organization_id],
+      params,
     );
     res.json({ configs: rows });
   } catch (err) {
@@ -228,10 +250,9 @@ router.post('/reports/configs', requireAuth, requireOrg, async (req: Request, re
   const {
     name, site_id, lot_id, cycle_id,
     schedule = null, schedule_day = null,
-    params = {}, enabled = true,
+    params = {}, enabled = true, is_shared = false,
   } = parsed.data;
 
-  // If a lot_id is given, verify it belongs to this org
   if (lot_id) {
     const { rows } = await pool.query(
       `SELECT site_id FROM lots WHERE id = $1 AND organization_id = $2`,
@@ -243,7 +264,6 @@ router.post('/reports/configs', requireAuth, requireOrg, async (req: Request, re
     }
   }
 
-  // If a cycle_id is given, verify it belongs to a lot of this org
   if (cycle_id) {
     const { rows } = await pool.query(
       `SELECT l.site_id
@@ -261,14 +281,16 @@ router.post('/reports/configs', requireAuth, requireOrg, async (req: Request, re
   try {
     const { rows } = await pool.query(
       `INSERT INTO report_configs
-         (organization_id, site_id, lot_id, cycle_id, name, schedule, schedule_day, params, enabled)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         (organization_id, site_id, lot_id, cycle_id, name, schedule, schedule_day,
+          params, enabled, created_by, is_shared)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id`,
       [
         req.user!.organization_id,
         site_id ?? null, lot_id ?? null, cycle_id ?? null,
         name, schedule, schedule_day,
         JSON.stringify(params), enabled,
+        req.user!.auth0_sub, is_shared,
       ],
     );
     res.status(201).json({ id: rows[0].id });
@@ -281,10 +303,17 @@ router.post('/reports/configs', requireAuth, requireOrg, async (req: Request, re
 // ── GET /dashboard/reports/configs/:id ───────────────────────────────────────
 router.get('/reports/configs/:id', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
+  const isPrivileged = roleRank(req.user!.role) >= PRIVILEGED_RANK;
+  const params: unknown[] = [id, req.user!.organization_id];
+  const visClause = isPrivileged
+    ? ''
+    : `AND (rc.created_by = $${params.push(req.user!.auth0_sub)} OR rc.is_shared = true)`;
+
   try {
     const { rows } = await pool.query(
       `SELECT rc.id, rc.name, rc.site_id, rc.lot_id, rc.cycle_id,
-              rc.schedule, rc.schedule_day, rc.params, rc.enabled, rc.created_at,
+              rc.schedule, rc.schedule_day, rc.params, rc.enabled,
+              rc.created_by, rc.is_shared, rc.created_at,
               l.name  AS lot_name,
               lc.name AS cycle_name,
               lc.crop_type,
@@ -292,8 +321,9 @@ router.get('/reports/configs/:id', requireAuth, requireOrg, async (req: Request,
          FROM report_configs rc
          LEFT JOIN lots       l  ON l.id  = rc.lot_id
          LEFT JOIN lot_cycles lc ON lc.id = rc.cycle_id
-        WHERE rc.id = $1 AND rc.organization_id = $2`,
-      [id, req.user!.organization_id],
+        WHERE rc.id = $1 AND rc.organization_id = $2
+          ${visClause}`,
+      params,
     );
     if (!rows[0]) {
       res.status(404).json({ error: 'Report config not found' });
@@ -316,9 +346,8 @@ router.patch('/reports/configs/:id', requireAuth, requireOrg, async (req: Reques
     return;
   }
 
-  const { name, schedule, schedule_day, params, enabled } = parsed.data;
+  const { name, schedule, schedule_day, params, enabled, is_shared } = parsed.data;
 
-  // Build dynamic SET clause
   const updates: string[] = [];
   const values: unknown[] = [];
   let i = 1;
@@ -328,22 +357,28 @@ router.patch('/reports/configs/:id', requireAuth, requireOrg, async (req: Reques
   if (schedule_day !== undefined) { updates.push(`schedule_day = $${i++}`); values.push(schedule_day) }
   if (params       !== undefined) { updates.push(`params = $${i++}`);       values.push(JSON.stringify(params)) }
   if (enabled      !== undefined) { updates.push(`enabled = $${i++}`);      values.push(enabled) }
+  if (is_shared    !== undefined) { updates.push(`is_shared = $${i++}`);    values.push(is_shared) }
 
   if (updates.length === 0) {
     res.status(400).json({ error: 'No fields to update' });
     return;
   }
 
+  // Owner can edit their own config; producer+ can edit any org config.
+  const isPrivileged = roleRank(req.user!.role) >= PRIVILEGED_RANK;
+  const ownerClause  = isPrivileged ? '' : `AND created_by = $${i++}`;
+  if (!isPrivileged) values.push(req.user!.auth0_sub);
+
   values.push(id, req.user!.organization_id);
 
   try {
     const { rowCount } = await pool.query(
       `UPDATE report_configs SET ${updates.join(', ')}
-        WHERE id = $${i++} AND organization_id = $${i++}`,
+        WHERE id = $${i++} AND organization_id = $${i++} ${ownerClause}`,
       values,
     );
     if (rowCount === 0) {
-      res.status(404).json({ error: 'Report config not found' });
+      res.status(404).json({ error: 'Report config not found or not authorized' });
       return;
     }
     res.json({ ok: true });
@@ -356,13 +391,18 @@ router.patch('/reports/configs/:id', requireAuth, requireOrg, async (req: Reques
 // ── DELETE /dashboard/reports/configs/:id ────────────────────────────────────
 router.delete('/reports/configs/:id', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
+  // Owner can delete their own config; producer+ can delete any org config.
+  const isPrivileged = roleRank(req.user!.role) >= PRIVILEGED_RANK;
+  const params: unknown[] = [id, req.user!.organization_id];
+  const ownerClause = isPrivileged ? '' : `AND created_by = $${params.push(req.user!.auth0_sub)}`;
+
   try {
     const { rowCount } = await pool.query(
-      `DELETE FROM report_configs WHERE id = $1 AND organization_id = $2`,
-      [id, req.user!.organization_id],
+      `DELETE FROM report_configs WHERE id = $1 AND organization_id = $2 ${ownerClause}`,
+      params,
     );
     if (rowCount === 0) {
-      res.status(404).json({ error: 'Report config not found' });
+      res.status(404).json({ error: 'Report config not found or not authorized' });
       return;
     }
     res.json({ ok: true });
@@ -373,8 +413,6 @@ router.delete('/reports/configs/:id', requireAuth, requireOrg, async (req: Reque
 });
 
 // ── POST /dashboard/reports/configs/:id/run ───────────────────────────────────
-// Triggers a manual report run for a given period.
-// Creates a 'pending' run, computes synchronously, then marks as 'done' or 'error'.
 router.post('/reports/configs/:id/run', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
 
@@ -391,10 +429,17 @@ router.post('/reports/configs/:id/run', requireAuth, requireOrg, async (req: Req
     return;
   }
 
-  // Verify config belongs to this org and has a cycle to calculate against
+  // Any user who can see the config (own or shared) can run it.
+  const isPrivileged = roleRank(req.user!.role) >= PRIVILEGED_RANK;
+  const visParams: unknown[] = [id, req.user!.organization_id];
+  const visClause = isPrivileged
+    ? ''
+    : `AND (created_by = $${visParams.push(req.user!.auth0_sub)} OR is_shared = true)`;
+
   const { rows: configRows } = await pool.query(
-    `SELECT id, cycle_id, params FROM report_configs WHERE id = $1 AND organization_id = $2`,
-    [id, req.user!.organization_id],
+    `SELECT id, cycle_id, params FROM report_configs
+      WHERE id = $1 AND organization_id = $2 ${visClause}`,
+    visParams,
   );
   if (!configRows[0]) {
     res.status(404).json({ error: 'Report config not found' });
@@ -407,17 +452,13 @@ router.post('/reports/configs/:id/run', requireAuth, requireOrg, async (req: Req
     return;
   }
 
-  // Insert a pending run first so we have an ID to return
   const { rows: runRows } = await pool.query(
     `INSERT INTO report_runs (config_id, period_start, period_end, status)
-     VALUES ($1, $2, $3, 'pending')
-     RETURNING id`,
+     VALUES ($1, $2, $3, 'pending') RETURNING id`,
     [id, period_start, period_end],
   );
   const runId: string = runRows[0].id;
 
-  // Compute synchronously — if the period is large this could be slow,
-  // but for weekly/monthly ranges over a single lot it's acceptable.
   try {
     const params = reportParamsSchema.parse(config.params ?? {});
     const result = await computeReport(config.cycle_id, period_start, period_end, params);
@@ -426,7 +467,6 @@ router.post('/reports/configs/:id/run', requireAuth, requireOrg, async (req: Req
       `UPDATE report_runs SET status = 'done', result = $1 WHERE id = $2`,
       [JSON.stringify(result), runId],
     );
-
     res.status(201).json({ id: runId, status: 'done' });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
@@ -440,9 +480,14 @@ router.post('/reports/configs/:id/run', requireAuth, requireOrg, async (req: Req
 });
 
 // ── GET /dashboard/reports/runs ──────────────────────────────────────────────
-// Lists runs for the org. Optional query param: ?config_id=UUID
 router.get('/reports/runs', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const configId = typeof req.query.config_id === 'string' ? req.query.config_id : null;
+  const isPrivileged = roleRank(req.user!.role) >= PRIVILEGED_RANK;
+  const params: unknown[] = [req.user!.organization_id];
+  const visClause = isPrivileged
+    ? ''
+    : `AND (rc.created_by = $${params.push(req.user!.auth0_sub)} OR rc.is_shared = true)`;
+  params.push(configId);
 
   try {
     const { rows } = await pool.query(
@@ -451,10 +496,11 @@ router.get('/reports/runs', requireAuth, requireOrg, async (req: Request, res: R
          FROM report_runs rr
          JOIN report_configs rc ON rc.id = rr.config_id
         WHERE rc.organization_id = $1
-          AND ($2::uuid IS NULL OR rr.config_id = $2)
+          ${visClause}
+          AND ($${params.length}::uuid IS NULL OR rr.config_id = $${params.length})
         ORDER BY rr.created_at DESC
         LIMIT 100`,
-      [req.user!.organization_id, configId],
+      params,
     );
     res.json({ runs: rows });
   } catch (err) {
@@ -466,14 +512,20 @@ router.get('/reports/runs', requireAuth, requireOrg, async (req: Request, res: R
 // ── GET /dashboard/reports/runs/:id ──────────────────────────────────────────
 router.get('/reports/runs/:id', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
   const { id } = req.params;
+  const isPrivileged = roleRank(req.user!.role) >= PRIVILEGED_RANK;
+  const params: unknown[] = [id, req.user!.organization_id];
+  const visClause = isPrivileged
+    ? ''
+    : `AND (rc.created_by = $${params.push(req.user!.auth0_sub)} OR rc.is_shared = true)`;
+
   try {
     const { rows } = await pool.query(
       `SELECT rr.id, rr.config_id, rc.name AS config_name,
               rr.period_start, rr.period_end, rr.status, rr.result, rr.error_msg, rr.created_at
          FROM report_runs rr
          JOIN report_configs rc ON rc.id = rr.config_id
-        WHERE rr.id = $1 AND rc.organization_id = $2`,
-      [id, req.user!.organization_id],
+        WHERE rr.id = $1 AND rc.organization_id = $2 ${visClause}`,
+      params,
     );
     if (!rows[0]) {
       res.status(404).json({ error: 'Report run not found' });
@@ -482,6 +534,141 @@ router.get('/reports/runs/:id', requireAuth, requireOrg, async (req: Request, re
     res.json({ run: rows[0] });
   } catch (err) {
     console.error('Error fetching report run:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── POST /dashboard/reports/explore ──────────────────────────────────────────
+// Ad-hoc telemetry exploration: given an entity (node or lot) and a date range,
+// computes daily series + totals for one or more metric/threshold queries.
+// Results are NOT saved — this is a one-off computation for interactive use.
+router.post('/reports/explore', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  const parsed = exploreSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0].message });
+    return;
+  }
+
+  const { entity_type, entity_id, date_from, date_to, queries } = parsed.data;
+
+  if (date_from >= date_to) {
+    res.status(400).json({ error: 'date_from must be before date_to' });
+    return;
+  }
+
+  // ── Resolve entity to device UUIDs and a display name ──────────────────────
+  let deviceUuids: string[] = [];
+  let entityName = '';
+
+  if (entity_type === 'node') {
+    const { rows } = await pool.query(
+      `SELECT id, COALESCE(display_name, legacy_device_name, device_id) AS name, site_id
+         FROM devices WHERE id = $1 AND organization_id = $2`,
+      [entity_id, req.user!.organization_id],
+    );
+    if (!rows[0]) { res.status(404).json({ error: 'Dispositivo no encontrado' }); return; }
+    if (!userHasSiteAccess(req.user!.site_ids, rows[0].site_id)) {
+      res.status(403).json({ error: 'Sin acceso a este site' }); return;
+    }
+    deviceUuids = [rows[0].id];
+    entityName  = rows[0].name;
+
+  } else {
+    // lot — aggregate telemetry across all assigned nodes
+    const { rows: lotRows } = await pool.query(
+      `SELECT id, name, site_id FROM lots WHERE id = $1 AND organization_id = $2`,
+      [entity_id, req.user!.organization_id],
+    );
+    if (!lotRows[0]) { res.status(404).json({ error: 'Lote no encontrado' }); return; }
+    if (!userHasSiteAccess(req.user!.site_ids, lotRows[0].site_id)) {
+      res.status(403).json({ error: 'Sin acceso a este site' }); return;
+    }
+    entityName = lotRows[0].name;
+
+    const { rows: nodeRows } = await pool.query(
+      `SELECT d.id FROM lot_nodes ln JOIN devices d ON d.id = ln.device_id WHERE ln.lot_id = $1`,
+      [entity_id],
+    );
+    deviceUuids = nodeRows.map((r: { id: string }) => r.id);
+  }
+
+  // Lot with no assigned nodes — return empty results immediately
+  if (deviceUuids.length === 0) {
+    res.json({
+      entity_name: entityName, entity_type, date_from, date_to,
+      results: queries.map((q) => ({
+        metric: q.metric, threshold: q.threshold, operator: q.operator,
+        label: q.label ?? null, series: [], totals: null,
+      })),
+    });
+    return;
+  }
+
+  // ── Run each metric query in parallel ─────────────────────────────────────
+  try {
+    const results = await Promise.all(
+      queries.map(async (q) => {
+        const col   = METRIC_COL[q.metric];  // safe — from validated enum
+        const opSql = OP_SQL[q.operator];    // safe — from validated enum
+
+        // Daily series: avg/max/min per day + hours meeting the threshold condition
+        const { rows: seriesRows } = await pool.query(
+          `SELECT
+             DATE_TRUNC('day', ts)::date             AS date,
+             ROUND(AVG(${col})::numeric, 2)          AS avg,
+             ROUND(MAX(${col})::numeric, 2)          AS max,
+             ROUND(MIN(${col})::numeric, 2)          AS min,
+             COUNT(*) FILTER (WHERE ${col} ${opSql} $4) AS hours_condition
+           FROM telemetry_norm
+          WHERE device_id = ANY($1::uuid[])
+            AND ts >= $2::date
+            AND ts < ($3::date + INTERVAL '1 day')
+            AND ${col} IS NOT NULL
+          GROUP BY 1
+          ORDER BY 1`,
+          [deviceUuids, date_from, date_to, q.threshold],
+        );
+
+        // Period totals: single aggregate over the full range
+        const { rows: totalRows } = await pool.query(
+          `SELECT
+             ROUND(AVG(${col})::numeric, 2)          AS avg_period,
+             ROUND(MAX(${col})::numeric, 2)          AS max_period,
+             ROUND(MIN(${col})::numeric, 2)          AS min_period,
+             COUNT(*) FILTER (WHERE ${col} ${opSql} $4) AS total_hours_condition
+           FROM telemetry_norm
+          WHERE device_id = ANY($1::uuid[])
+            AND ts >= $2::date
+            AND ts < ($3::date + INTERVAL '1 day')
+            AND ${col} IS NOT NULL`,
+          [deviceUuids, date_from, date_to, q.threshold],
+        );
+
+        return {
+          metric:    q.metric,
+          threshold: q.threshold,
+          operator:  q.operator,
+          label:     q.label ?? null,
+          series: seriesRows.map((r: Record<string, unknown>) => ({
+            date:            r.date,
+            avg:             r.avg  !== null ? Number(r.avg)  : null,
+            max:             r.max  !== null ? Number(r.max)  : null,
+            min:             r.min  !== null ? Number(r.min)  : null,
+            hours_condition: Number(r.hours_condition),
+          })),
+          totals: totalRows[0]?.avg_period !== null ? {
+            avg_period:            Number(totalRows[0].avg_period),
+            max_period:            Number(totalRows[0].max_period),
+            min_period:            Number(totalRows[0].min_period),
+            total_hours_condition: Number(totalRows[0].total_hours_condition),
+          } : null,
+        };
+      }),
+    );
+
+    res.json({ entity_name: entityName, entity_type, date_from, date_to, results });
+  } catch (err) {
+    console.error('Error running explore query:', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
