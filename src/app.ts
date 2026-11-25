@@ -18,6 +18,7 @@ import nurseryCustomersRouter from './routes/dashboard/nursery/customers';
 import nurseryOrdersRouter from './routes/dashboard/nursery/orders';
 import nurseryBatchesRouter from './routes/dashboard/nursery/batches';
 import nurseryTraysRouter from './routes/dashboard/nursery/trays';
+import nurseryReportsRouter from './routes/dashboard/nursery/reports';
 import dashboardReportsRouter from './routes/dashboard/reports';
 import { requireAuth, requireOrg, requireFeature } from './middleware/auth';
 
@@ -106,6 +107,7 @@ app.use('/dashboard', requireAuth, requireOrg, requireFeature('nursery'), nurser
 app.use('/dashboard', requireAuth, requireOrg, requireFeature('nursery'), nurseryOrdersRouter);
 app.use('/dashboard', requireAuth, requireOrg, requireFeature('nursery'), nurseryBatchesRouter);
 app.use('/dashboard', requireAuth, requireOrg, requireFeature('nursery'), nurseryTraysRouter);
+app.use('/dashboard', requireAuth, requireOrg, requireFeature('nursery'), nurseryReportsRouter);
 app.use('/dashboard', requireAuth, requireOrg, requireFeature('reports'), dashboardReportsRouter);
 
 // Bind to localhost only — nginx proxies from outside

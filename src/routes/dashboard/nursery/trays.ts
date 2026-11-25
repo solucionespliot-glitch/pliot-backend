@@ -5,6 +5,21 @@ import { requireAuth, requireOrg, requireRole } from '../../../middleware/auth';
 
 const router = Router();
 
+// Valid one-way status transitions for individual trays (mirrors batch state machine)
+const TRAY_VALID_TRANSITIONS: Record<string, string[]> = {
+  sowing:           ['germination'],
+  germination:      ['nursery'],
+  grafting_chamber: ['nursery'],
+  nursery:          ['delivered'],
+};
+
+const trayTransitionSchema = z.object({
+  to_status:   z.enum(['germination', 'nursery', 'delivered']),
+  node_id:     z.string().uuid().optional(),
+  occurred_at: z.string().datetime().optional(),
+  notes:       z.string().trim().max(1000).optional(),
+});
+
 const eliminateSchema = z.object({
   reason: z.enum(['seed_shortage', 'broken', 'theft', 'gifted', 'pest', 'disease', 'other']),
   notes:  z.string().trim().max(1000).optional(),
@@ -348,6 +363,139 @@ router.get('/nursery/pending-eliminations', requireAuth, requireOrg, async (req:
     res.json({ pending: rows });
   } catch (err) {
     console.error('[GET /nursery/pending-eliminations]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── POST /dashboard/nursery/trays/:id/transition ──────────────────────────────
+// Transitions a single tray to the next status, independently of the batch.
+// This breaks batch homogeneity: the parent batch is marked is_homogeneous = false
+// so the UI knows it must track trays individually.
+//
+// Use this when one tray needs to advance ahead of or separately from the rest of
+// the batch (e.g. a tray moved to nursery while others are still in germination).
+router.post('/nursery/trays/:id/transition', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  const parsed = trayTransitionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: parsed.error.issues[0].message });
+    return;
+  }
+
+  const { id }                     = req.params;
+  const { organization_id, auth0_sub } = req.user!;
+  const { to_status, node_id, occurred_at, notes } = parsed.data;
+  const ts = occurred_at ? new Date(occurred_at) : new Date();
+
+  try {
+    const { rows: trayRows } = await pool.query(
+      `SELECT t.id, t.status, t.batch_id
+         FROM nursery_trays t
+        WHERE t.id = $1 AND t.organization_id = $2`,
+      [id, organization_id],
+    );
+    if (!trayRows[0]) { res.status(404).json({ error: 'Tray not found' }); return; }
+
+    const tray    = trayRows[0];
+    const current = tray.status as string;
+
+    if (tray.is_eliminated) {
+      res.status(400).json({ error: 'Cannot transition an eliminated tray' });
+      return;
+    }
+
+    const allowed = TRAY_VALID_TRANSITIONS[current] ?? [];
+    if (!allowed.includes(to_status)) {
+      res.status(400).json({
+        error: `Cannot transition tray from '${current}' to '${to_status}'. Allowed: ${allowed.join(', ') || 'none'}`,
+      });
+      return;
+    }
+
+    // Stage-specific timestamp columns on the tray
+    const stageTimestamps: Record<string, string> = {
+      germination: `germination_entry_at = $3`,
+      nursery:     `nursery_placed_at = $3`,
+      delivered:   `delivered_at = $3`,
+    };
+    const extraSet = stageTimestamps[to_status] ?? '';
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Update the tray's status and stage timestamp
+      await client.query(
+        `UPDATE nursery_trays
+            SET status          = $1,
+                current_node_id = COALESCE($2, current_node_id),
+                ${extraSet ? extraSet + ',' : ''}
+                updated_at      = NOW()
+          WHERE id = $${extraSet ? '4' : '3'} AND organization_id = $${extraSet ? '5' : '4'}`,
+        extraSet
+          ? [to_status, node_id ?? null, ts, id, organization_id]
+          : [to_status, node_id ?? null, id, organization_id],
+      );
+
+      // Log the individual tray transition
+      await client.query(
+        `INSERT INTO nursery_tray_transitions
+           (tray_id, batch_id, from_status, to_status, source, node_id, notes, created_by, occurred_at)
+         VALUES ($1, $2, $3, $4, 'individual', $5, $6, $7, $8)`,
+        [id, tray.batch_id, current, to_status, node_id ?? null, notes ?? null, auth0_sub, ts],
+      );
+
+      // Mark the parent batch as non-homogeneous because a tray diverged
+      await client.query(
+        `UPDATE nursery_batches
+            SET is_homogeneous            = false,
+                homogeneous_broken_at     = NOW(),
+                homogeneous_broken_reason = 'individual_transition',
+                updated_at                = NOW()
+          WHERE id = $1 AND is_homogeneous = true`,
+        [tray.batch_id],
+      );
+
+      await client.query('COMMIT');
+      res.json({ ok: true, tray_id: id, from_status: current, to_status });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('[POST /nursery/trays/:id/transition]', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ── GET /dashboard/nursery/trays/:id/transitions ──────────────────────────────
+// Returns the full status transition history for a tray, ordered chronologically.
+router.get('/nursery/trays/:id/transitions', requireAuth, requireOrg, async (req: Request, res: Response): Promise<void> => {
+  const { id }              = req.params;
+  const { organization_id } = req.user!;
+
+  try {
+    // Verify tray belongs to this org
+    const { rows: check } = await pool.query(
+      `SELECT id FROM nursery_trays WHERE id = $1 AND organization_id = $2`,
+      [id, organization_id],
+    );
+    if (!check[0]) { res.status(404).json({ error: 'Tray not found' }); return; }
+
+    const { rows } = await pool.query(
+      `SELECT tt.id, tt.from_status, tt.to_status, tt.source, tt.notes,
+              tt.occurred_at, tt.created_by,
+              d.device_id AS node_device_id
+         FROM nursery_tray_transitions tt
+         LEFT JOIN devices d ON d.id = tt.node_id
+        WHERE tt.tray_id = $1
+        ORDER BY tt.occurred_at ASC`,
+      [id],
+    );
+    res.json({ transitions: rows });
+  } catch (err) {
+    console.error('[GET /nursery/trays/:id/transitions]', err);
     res.status(500).json({ error: 'Internal server error' });
   }
 });

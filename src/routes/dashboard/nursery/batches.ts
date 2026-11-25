@@ -254,7 +254,7 @@ router.post('/nursery/batches/:id/confirm-sowing', requireAuth, requireOrg, asyn
       );
 
       // Insert one row per tray; last tray may have fewer cells than tray_size
-      const insertedTrays: unknown[] = [];
+      const insertedTrays: { id: string; tray_number: number; qr_code: string; plant_capacity: number; status: string }[] = [];
       for (let n = 1; n <= total_trays; n++) {
         const isLast         = n === total_trays;
         const plant_capacity = isLast && partial_seeds > 0 ? partial_seeds : tray_size;
@@ -270,6 +270,15 @@ router.post('/nursery/batches/:id/confirm-sowing', requireAuth, requireOrg, asyn
         );
         insertedTrays.push(trayRows[0]);
       }
+
+      // Log initial transition (null → sowing) for every created tray
+      const trayIds = insertedTrays.map(t => t.id);
+      await client.query(
+        `INSERT INTO nursery_tray_transitions
+           (tray_id, batch_id, from_status, to_status, source, node_id, created_by, occurred_at)
+         SELECT unnest($1::uuid[]), $2, NULL, 'sowing', 'batch', $3, $4, NOW()`,
+        [trayIds, id, sowing_node_id ?? null, auth0_sub],
+      );
 
       // Auto-advance order status to in_production if it was confirmed
       await client.query(
@@ -310,7 +319,7 @@ router.post('/nursery/batches/:id/transition', requireAuth, requireOrg, async (r
   }
 
   const { id }            = req.params;
-  const { organization_id } = req.user!;
+  const { organization_id, auth0_sub } = req.user!;
   const { to_status, node_id, occurred_at, apply_to_trays } = parsed.data;
   const ts = occurred_at ? new Date(occurred_at) : new Date();
 
@@ -356,15 +365,39 @@ router.post('/nursery/batches/:id/transition', requireAuth, requireOrg, async (r
 
       // Propagate to active trays if requested
       if (apply_to_trays) {
-        await client.query(
+        // Use RETURNING to capture which trays were actually updated
+        const { rows: updatedTrayRows } = await client.query(
           `UPDATE nursery_trays
-              SET status         = $1,
+              SET status          = $1,
                   current_node_id = COALESCE($2, current_node_id),
-                  updated_at     = NOW()
+                  updated_at      = NOW()
             WHERE batch_id = $3
               AND is_eliminated = false
-              AND status NOT IN ('delivered', 'eliminated')`,
+              AND status NOT IN ('delivered', 'eliminated')
+            RETURNING id`,
           [to_status, node_id ?? null, id],
+        );
+
+        // Log a transition record for each updated tray
+        if (updatedTrayRows.length > 0) {
+          const updatedIds = updatedTrayRows.map((r: { id: string }) => r.id);
+          await client.query(
+            `INSERT INTO nursery_tray_transitions
+               (tray_id, batch_id, from_status, to_status, source, node_id, created_by, occurred_at)
+             SELECT unnest($1::uuid[]), $2, $3, $4, 'batch', $5, $6, $7`,
+            [updatedIds, id, current, to_status, node_id ?? null, auth0_sub, ts],
+          );
+        }
+      } else {
+        // Batch transitioned but trays were not updated → mark batch non-homogeneous
+        await client.query(
+          `UPDATE nursery_batches
+              SET is_homogeneous            = false,
+                  homogeneous_broken_at     = NOW(),
+                  homogeneous_broken_reason = 'individual_transition',
+                  updated_at                = NOW()
+            WHERE id = $1 AND is_homogeneous = true`,
+          [id],
         );
       }
 
